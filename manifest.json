@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "抖音直播中控助手",
-  "description": "直接操作抖音直播中控台，实现自动讲解、自动发评、弹幕关键词自动回复",
-  "version": "2.2.0",
+  "description": "直接操作抖音直播/团购中控台，实现自动讲解、自动发评、弹幕关键词自动回复",
+  "version": "2.4.0",
   "action": {
     "default_title": "抖音直播中控助手",
     "default_icon": "assets/icon/logo.png",
@@ -10,7 +10,8 @@
   },
   "permissions": [],
   "host_permissions": [
-    "https://buyin.jinritemai.com/*"
+    "https://buyin.jinritemai.com/*",
+    "https://eos.douyin.com/*"
   ],
   "background": {
     "service_worker": "js/background.js"
@@ -23,7 +24,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://buyin.jinritemai.com/dashboard/live/control*"
+        "https://buyin.jinritemai.com/dashboard/live/control*",
+        "https://eos.douyin.com/livesite/live/current*"
       ],
       "js": ["js/content.js"],
       "run_at": "document_end"
@@ -37,7 +39,10 @@
   "web_accessible_resources": [
     {
       "resources": ["js/inject.js", "js/probe.js", "css/panel.css", "assets/*"],
-      "matches": ["https://buyin.jinritemai.com/*"]
+      "matches": [
+        "https://buyin.jinritemai.com/*",
+        "https://eos.douyin.com/*"
+      ]
     },
     {
       "resources": ["js/bridge-inject.js"],

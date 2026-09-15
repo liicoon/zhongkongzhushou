@@ -19,13 +19,16 @@
   var HOST = window.location.host;
   var PATH = window.location.pathname || "";
 
-  // Only act on the Douyin live control page (manifest matches already restrict
-  // this script to buyin.jinritemai.com/dashboard/live/control — double-check
-  // here so a future manifest change cannot silently widen the blast radius).
-  if (
-    HOST === "buyin.jinritemai.com" &&
-    PATH.indexOf("/dashboard/live/control") === 0
-  ) {
+  // Supported consoles:
+  //   buyin.jinritemai.com/dashboard/live/control   抖音直播中控台
+  //   eos.douyin.com/livesite/live/current          抖音团购中控台
+  // (manifest matches already restrict this script — double-check here so a
+  // future manifest change cannot silently widen the blast radius.)
+  var SUPPORTED =
+    (HOST === "buyin.jinritemai.com" && PATH.indexOf("/dashboard/live/control") === 0) ||
+    (HOST === "eos.douyin.com" && PATH.indexOf("/livesite/live/current") === 0);
+
+  if (SUPPORTED) {
     injectCSS("css/panel.css");
     injectScript("js/probe.js");
     // inject.js 延时加载，让 probe 先运行收集信息

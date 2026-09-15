@@ -67,6 +67,27 @@
       } catch (_) { return false; }
     },
 
+    // 回车发送（keydown/keypress/keyup 三连，兼容只监听其中一种的组件）
+    pressEnter: function (el) {
+      if (!el) return false;
+      var types = ["keydown", "keypress", "keyup"];
+      for (var i = 0; i < types.length; i++) {
+        try {
+          el.dispatchEvent(new KeyboardEvent(types[i], {
+            key: "Enter", code: "Enter", keyCode: 13, which: 13,
+            bubbles: true, cancelable: true,
+          }));
+        } catch (_) {}
+      }
+      return true;
+    },
+
+    // 元素是否可见（隐藏标签页/折叠面板要能区分出来）
+    isVisible: function (el) {
+      if (!el) return false;
+      return el.offsetParent !== null || el.getClientRects().length > 0;
+    },
+
     // check if text matches an explain button (not "求讲解" or other false matches)
     isExplainBtnText: function (text) {
       return text === "讲解" || text === "自动讲解" || text === "取消讲解";
@@ -99,6 +120,41 @@
       // deduplicate and sort
       var seen = {};
       return result.filter(function (v) { return seen[v] ? false : (seen[v] = true); }).sort(function (a, b) { return a - b; });
+    },
+  };
+
+  // ========================================================================
+  //  SITE PROFILE – 多站点适配（直播中控台 / 团购中控台）
+  //  两个站点的前端组件库完全不同，用"站点档案"把差异集中收口在这里，
+  //  其余模块只问 Site 是哪个站，不散落 host 判断：
+  //    buyin  buyin.jinritemai.com/dashboard/live/control  商品=goodsItem 行（全量渲染）
+  //    eos    eos.douyin.com/livesite/live/current         商品=虚拟滚动 list-wrap，评论=评论区
+  // ========================================================================
+  var Site = {
+    _id: null,
+    PROFILES: [
+      { id: "buyin", host: "buyin.jinritemai.com", path: "/dashboard/live/control", label: "直播中控台" },
+      { id: "eos", host: "eos.douyin.com", path: "/livesite/live/current", label: "团购中控台" },
+    ],
+    detect: function () {
+      if (this._id) return this._id;
+      var host = window.location.host;
+      var path = window.location.pathname || "";
+      this._id = "unknown";
+      for (var i = 0; i < this.PROFILES.length; i++) {
+        var p = this.PROFILES[i];
+        if (host === p.host && path.indexOf(p.path) === 0) { this._id = p.id; break; }
+      }
+      return this._id;
+    },
+    isEos: function () { return this.detect() === "eos"; },
+    supported: function () { return this.detect() !== "unknown"; },
+    label: function () {
+      var id = this.detect();
+      for (var i = 0; i < this.PROFILES.length; i++) {
+        if (this.PROFILES[i].id === id) return this.PROFILES[i].label;
+      }
+      return "未知站点";
     },
   };
 
@@ -143,6 +199,9 @@
       var now = Date.now();
       if (now - this._cache.lastScan < 1000) return this._cache.products;
       this._cache.lastScan = now;
+
+      // eos（团购中控台）商品列表是虚拟滚动，扫描逻辑完全不同 → 走独立分支
+      if (Site.isEos()) return this._scanProductsEos();
 
       var products = [];
       var seen = {};
@@ -355,6 +414,9 @@
     //   <button class="lvc2-grey-btn ..." style="...">讲解</button>
     _findExplainBtnInRow: function (row) {
       if (!row || !row.querySelectorAll) return null;
+      // eos（团购中控台）：讲解按钮是 div[class*='talking-btn']（不是 button，
+      // 通用扫描抓不到），用专属选择器一步定位；取不到即说明该行不是商品行
+      if (Site.isEos()) return this.eosExplainBtn(row);
       // 1. known component class first (most reliable)
       var known = row.querySelectorAll("button.lvc2-grey-btn, button[class*='grey-btn'], button[class*='GreyBtn']");
       for (var i = 0; i < known.length; i++) {
@@ -375,12 +437,200 @@
       return null;
     },
 
+    // ---------- eos（团购中控台）: 团购商品列表（虚拟滚动） ----------
+    // 实测结构（2026-09-14，主人贴的真实 DOM）：
+    //   div#live-card-list > div.list-wrap-afHxzG
+    //   └── div(style: height:633px; overflow:auto)          ← 滚动容器（视口）
+    //       └── div(style: height: 总行数 × 行高)             ← 内容高度容器（912px）
+    //           └── div[data-rfd-draggable-id][data-index]    ← 一行（绝对定位，height:152）
+    //               ├── [class*='drag-number'] input.sort-input-*   ← 序号（maxlength=2，1-based）
+    //               ├── [class*='card-name'] [class*='render-1']    ← 商品名
+    //               │   （同名文本还有 [class*='fictitious-*'] 量宽副本，不能用）
+    //               ├── [class*='poi-'] [class*='render-nXrSFh']    ← 门店名"汉中市周大黑…"
+    //               ├── [class*='operate-area'] [class*='talking-btn'] [class*='talking-word']
+    //               │                                                ← "讲解" / "取消讲解"
+    //               └── [class*='stats-'] 曝光/点击/支付订单数/销售额
+    // 总行数推算已实测对齐：912 ÷ 152 = 6，与筛选标签「全部(6)」一致 ✓
+    // 注意 operate-area 与 stats 是 render-item-* 的兄弟节点，仍在行 div 内 → row.querySelector 可达
+    _EOS_ROW_H: 152,
+
+    // 商品面板容器：实测带稳定 id `div#live-card-list`（优先），无 id 时退回 list-wrap 哈希类
+    eosWrapEl: function () {
+      return document.querySelector("#live-card-list") ||
+             document.querySelector("[class*='list-wrap']");
+    },
+
+    // 列表区信息：滚动容器 / 内容容器 / 行高 / 总行数
+    eosList: function () {
+      var wrap = this.eosWrapEl();
+      var row = (wrap || document).querySelector("[data-rfd-draggable-id]");
+      if (!row) return null;
+      if (!wrap) wrap = row.closest("[class*='list-wrap']") || document.body;
+      var inner = row.parentElement;                      // 内容高度容器
+      var scroller = inner ? inner.parentElement : null;  // 滚动容器
+      var rowH = parseFloat(row.style.height) || this._EOS_ROW_H;
+      var total = 0;
+      if (inner && inner.style && inner.style.height) {
+        var h = parseFloat(inner.style.height);
+        if (h > 0) total = Math.round(h / rowH);
+      }
+      // 用已渲染行的最大 data-index 修正总行数（内容高度可能尚未更新）
+      var drawn = (wrap || document).querySelectorAll("[data-rfd-draggable-id]");
+      for (var i = 0; i < drawn.length; i++) {
+        var di = parseInt(drawn[i].getAttribute("data-index"), 10);
+        if (!isNaN(di) && di + 1 > total) total = di + 1;
+      }
+      return { wrap: wrap, scroller: scroller, inner: inner, rowHeight: rowH, total: total };
+    },
+
+    // 已渲染（可视区）的行，按 data-index 升序
+    eosRows: function () {
+      var scope = this.eosWrapEl() || document;
+      var list = scope.querySelectorAll("[data-rfd-draggable-id]");
+      var out = [];
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].isConnected) out.push(list[i]);
+      }
+      out.sort(function (a, b) {
+        return (parseInt(a.getAttribute("data-index"), 10) || 0) -
+               (parseInt(b.getAttribute("data-index"), 10) || 0);
+      });
+      return out;
+    },
+
+    // 按 data-index 找"当前在 DOM 中"的行（虚拟列表里未渲染的行取不到）
+    eosFindRow: function (index) {
+      var rows = this.eosRows();
+      for (var i = 0; i < rows.length; i++) {
+        if (parseInt(rows[i].getAttribute("data-index"), 10) === index) return rows[i];
+      }
+      return null;
+    },
+
+    // 滚动列表让指定行进入可视区（虚拟列表必须先渲染才能点得到）
+    eosScrollTo: function (index) {
+      if (this.eosFindRow(index)) return true; // 已渲染，无需滚动
+      var info = this.eosList();
+      if (!info || !info.scroller) return false;
+      try {
+        info.scroller.scrollTop = index * info.rowHeight;
+        return true;
+      } catch (_) { return false; }
+    },
+
+    // 商品名：优先 card-name 内的 render-*（fictitious-* 是量宽用的重复副本）
+    eosName: function (row) {
+      if (!row || !row.querySelector) return "";
+      var el = row.querySelector("[class*='card-name'] [class*='render-1']") ||
+               row.querySelector("[class*='card-name']");
+      return el ? (el.textContent || "").trim().slice(0, 80) : "";
+    },
+
+    // 讲解按钮：div[class*='talking-btn']，文本 "讲解"（未讲解）/ "取消讲解"（讲解中）
+    eosExplainBtn: function (row) {
+      if (!row || !row.querySelector) return null;
+      var btn = row.querySelector("[class*='talking-btn']");
+      // 兜底：若操作区与卡片平级（不在行内），仅在"父级只含这一行"时使用，避免取到别行的按钮
+      if (!btn && row.parentElement &&
+          row.parentElement.querySelectorAll("[data-rfd-draggable-id]").length === 1) {
+        btn = row.parentElement.querySelector("[class*='talking-btn']");
+      }
+      if (!btn) return null;
+      return (btn.textContent || "").indexOf("讲解") !== -1 ? btn : null;
+    },
+
+    // eos 商品扫描：以 data-index 为主键；未渲染的行补占位项，
+    // 让"序号过滤"覆盖整个列表（点击前会自动滚动渲染，见 _eosEnsureRow）
+    _scanProductsEos: function () {
+      var rows = this.eosRows();
+      var byIndex = {};
+      var rendered = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var btn = this.eosExplainBtn(row);
+        if (!btn) continue; // 不是商品行
+        var idx = parseInt(row.getAttribute("data-index"), 10);
+        if (isNaN(idx)) idx = rendered;
+        byIndex[idx] = {
+          id: row.getAttribute("aria-label") || row.getAttribute("data-rfd-draggable-id") || ("eos_" + idx),
+          name: this.eosName(row),
+          price: "",
+          stock: "",
+          row: row,
+          explainBtn: btn,
+          eosIndex: idx,
+          scanIndex: idx,
+          rendered: true,
+        };
+        rendered++;
+      }
+
+      var info = this.eosList();
+      var maxIdx = -1;
+      for (var k in byIndex) {
+        if (byIndex.hasOwnProperty(k)) {
+          var ki = parseInt(k, 10);
+          if (ki > maxIdx) maxIdx = ki;
+        }
+      }
+      var total = Math.max(info ? info.total : 0, maxIdx + 1, rendered);
+      var products = [];
+      for (var j = 0; j < total; j++) {
+        if (byIndex[j]) products.push(byIndex[j]);
+        else {
+          // 未渲染的占位项：名称留空，点击前滚动渲染后再补
+          products.push({
+            id: "eos_" + j, name: "", price: "", stock: "",
+            row: null, explainBtn: null, eosIndex: j, scanIndex: j, rendered: false,
+          });
+        }
+      }
+      this._cache.products = products;
+      return products;
+    },
+
+    // 行是否仍在 DOM 且能取到讲解按钮
+    _isRowLive: function (product) {
+      return !!(product && product.row && product.row.isConnected && this.eosExplainBtn(product.row));
+    },
+
+    // eos：确保目标行已在 DOM 中（必要时滚动 + 等渲染），返回 Promise<row>
+    _eosEnsureRow: function (product) {
+      var self = this;
+      var idx = product.eosIndex;
+      var row = this.eosFindRow(idx);
+      if (row) return Promise.resolve(row);
+      this.eosScrollTo(idx);
+      return Utils.sleep(350).then(function () {
+        var r = self.eosFindRow(idx);
+        if (r) return r;
+        // 二次校正：虚拟列表首次滚动后位置可能被修正
+        self.eosScrollTo(idx);
+        return Utils.sleep(350).then(function () { return self.eosFindRow(idx); });
+      });
+    },
+
     // ---------- Auto Explain ----------
     // Click a product's "讲解" button.
     // The button text changes while explaining (取消讲解 / 讲解中 / 已讲解 …).
     // Any text that still references 讲解 identifies it as an explain button;
     // an already-explaining state is treated as success so we never toggle OFF.
     clickExplain: function (product) {
+      // eos（虚拟列表）：目标行未渲染时先滚动渲染、等一帧再点击 → 返回 Promise<boolean>
+      if (Site.isEos() && product && typeof product.eosIndex === "number" && !this._isRowLive(product)) {
+        var self = this;
+        return this._eosEnsureRow(product).then(function (row) {
+          if (!row) return false;
+          if (!product.name) product.name = self.eosName(row); // 占位项在渲染后补名
+          var b = self.eosExplainBtn(row);
+          if (!b) return false;
+          product.row = row;
+          product.explainBtn = b;
+          var tt = (b.textContent || "").trim();
+          if (tt.indexOf("取消") !== -1) return true; // 已在讲解中 → 视为成功，不反向关掉
+          return Utils.clickEl(b);
+        });
+      }
       var btn = this._locateExplainBtn(product);
       if (!btn) return false;
       var t = (btn.textContent || "").trim();
@@ -402,6 +652,21 @@
     // Click "取消讲解" — used by single-product mode to pause explaining.
     // No-op success when the product is not currently explaining.
     cancelExplain: function (product) {
+      // eos（虚拟列表）：同上，先确保目标行已渲染 → 返回 Promise<boolean>
+      if (Site.isEos() && product && typeof product.eosIndex === "number" && !this._isRowLive(product)) {
+        var self2 = this;
+        return this._eosEnsureRow(product).then(function (row) {
+          if (!row) return false;
+          if (!product.name) product.name = self2.eosName(row);
+          var b = self2.eosExplainBtn(row);
+          if (!b) return false;
+          product.row = row;
+          product.explainBtn = b;
+          var tt = (b.textContent || "").trim();
+          if (tt.indexOf("取消") === -1) return true; // 本来就没在讲解 → 视为成功
+          return Utils.clickEl(b);
+        });
+      }
       var btn = this._locateExplainBtn(product);
       if (!btn) return false;
       var t = (btn.textContent || "").trim();
@@ -442,6 +707,10 @@
     // Positional fallback matters because names extracted from metric-heavy rows
     // are unreliable after the SPA re-renders numbers mid-live.
     _locateRow: function (product) {
+      // eos（虚拟列表）：data-index 是唯一可靠定位键，直接取当前已渲染的目标行
+      if (Site.isEos() && product && typeof product.eosIndex === "number") {
+        return this.eosFindRow(product.eosIndex);
+      }
       var rows = [];
       var allRows = this._collectRows();
       for (var i = 0; i < allRows.length; i++) {
@@ -466,7 +735,68 @@
     },
 
     // ---------- Auto Comment ----------
+
+    // eos 评论输入框定位。实测真实结构（2026-09-14，含商品面板对照）：
+    //   评论区：div.comment-wrap-sJwP1r
+    //           └── div.input-wrap-j6Z8oG > div.text-area-CyjKXV
+    //               ├── div.text-input-SqqLWx > textarea.input-EghOjQ
+    //               │     placeholder="输入评论，Enter键发送"  maxlength=50
+    //               └── div.button-Wc1yvW 「发送」（空输入时带 button-disable-*）
+    //   商品面板（必须避开，实测两类误命中）：
+    //     #live-card-list [class*='list-wrap'] 内
+    //       ├── input.sort-input-Knhzky  序号框（maxlength=2）
+    //       └── input[placeholder='搜索商品名称或ID']
+    //           外层是 okee-current-live-input-wrapper —— 同样含 "input-wrap" 子串，
+    //           会被 [class*='input-wrap'] 命中（"input-wrapper" 包含 "input-wrap"）
+    _findEosCommentInput: function () {
+      // 0. 评论区外壳精确命中（comment-wrap 是评论区面板真实外壳，最可靠）
+      var shell = document.querySelector("[class*='comment-wrap']");
+      if (shell) {
+        var inShell = shell.querySelector("textarea");
+        if (inShell && Utils.isVisible(inShell)) return inShell;
+      }
+      var list = document.getElementById("comment_all_tab_list_container");
+      var scope = list;
+      for (var up = 0; up < 4 && scope && scope.parentElement; up++) scope = scope.parentElement;
+      if (!scope) scope = document;
+      // 1. 实测结构：text-area / input-wrap 内的 textarea（限定在评论区 scope 内，不外溢到商品面板）
+      var wrap = (scope.querySelector && scope.querySelector("[class*='text-area']")) ||
+                 (scope.querySelector && scope.querySelector("[class*='input-wrap']"));
+      if (wrap) {
+        var direct = wrap.querySelector("textarea");
+        if (direct && Utils.isVisible(direct)) return direct;
+      }
+      // 2. placeholder 兜底（"输入评论，Enter键发送"）
+      var byPh = document.querySelector("textarea[placeholder*='评论']");
+      if (byPh && Utils.isVisible(byPh)) return byPh;
+      // 3. 面板内启发式扫描（跳过商品面板 / 搜索框 / 序号框）
+      var cands = scope.querySelectorAll(
+        "textarea, input[type='text'], input:not([type]), [contenteditable='true']"
+      );
+      for (var i = 0; i < cands.length; i++) {
+        var el = cands[i];
+        if (el.offsetParent === null && el.getClientRects().length === 0) continue; // 不可见
+        if (el.closest && (el.closest("#live-card-list") || el.closest("[class*='list-wrap']"))) continue;
+        if ((el.getAttribute("placeholder") || "").indexOf("搜索") !== -1) continue; // 商品搜索框
+        var ml = el.getAttribute("maxlength");
+        if (ml && parseInt(ml, 10) <= 4) continue;                                   // 序号框
+        if (el.disabled || el.readOnly) continue;
+        return el;
+      }
+      return null;
+    },
+
     findCommentInput: function () {
+      // eos（团购中控台）：只认评论区专属定位 —— 该站的输入框结构已实测确认。
+      // 刻意不回退到下面的通用选择器：商品面板的"搜索商品名称或ID"框 class 是
+      // okee-current-live-input，会被 [class*='input'] 系列命中 → 回复会被打进商品搜索框，
+      // 比"找不到输入框"更糟（会静默改掉运营看到的商品列表）。
+      // 定位失败时返回 null，由 sendComment 打 warn 留痕，主人按日志贴 DOM 再适配。
+      if (Site.isEos()) {
+        var eosInput = this._findEosCommentInput();
+        if (!eosInput) log.warn("未找到评论输入框（评论区面板是否收起？）");
+        return eosInput || null;
+      }
       // Look for chat input area
       var selectors = [
         "textarea[class*='chat']", "textarea[class*='comment']",
@@ -502,11 +832,28 @@
       return null;
     },
 
-    findSendButton: function () {
+    findSendButton: function (input) {
       var texts = ["发送", "Send", "发布", "提交", "➤", "发"];
 
+      // Strategy 0（eos 团购中控台）：发送按钮是与输入框同级的 div.button-Wc1yvW（不是 button）。
+      // 坑：不能直接 document.querySelector("[class*='input-wrap']") —— 商品面板的搜索框 / 序号框
+      // 外层是 okee-current-live-input-wrapper，同样含 "input-wrap" 子串且在文档里更靠前，
+      // 会先命中它（实测踩到）。因此必须从"已定位到的评论输入框"往上找它自己的面板：
+      //   div.input-wrap-j6Z8oG > div.text-area-CyjKXV > { div.text-input-SqqLWx, div.button-Wc1yvW }
+      if (Site.isEos()) {
+        var eosIn = input || this._findEosCommentInput();
+        var eosScope = (eosIn && eosIn.closest)
+          ? (eosIn.closest("[class*='text-area']") || eosIn.closest("[class*='input-wrap']"))
+          : null;
+        for (var eu = 0; eu < 4 && eosScope; eu++) {
+          var eosBtn = eosScope.querySelector("[class*='button-']");
+          if (eosBtn && (eosBtn.textContent || "").trim().indexOf("发送") !== -1) return eosBtn;
+          eosScope = eosScope.parentElement;
+        }
+      }
+
       // Strategy 1: search near the chat input (most reliable)
-      var input = this.findCommentInput();
+      if (!input) input = this.findCommentInput();
       if (input) {
         // walk up from input through 5 levels of parent to find the chat container
         var container = input.parentElement;
@@ -577,9 +924,34 @@
         log.warn("未找到聊天输入框");
         return false;
       }
+      // 输入框有 maxlength 时（eos 评论区实测 = 50）超长内容页面不接受 → 先截断并留痕，
+      // 否则会表现为"点了发送但评论没出来"，很难排查
+      var maxLen = parseInt(input.getAttribute("maxlength"), 10);
+      if (!isNaN(maxLen) && maxLen > 0 && text.length > maxLen) {
+        log.warn("回复超过输入框上限 " + maxLen + " 字，已截断：" + text);
+        text = text.slice(0, maxLen);
+      }
       Utils.triggerVueInput(input, text);
       // 记录本次发送文本，供弹幕监听识别"自己发的弹幕"（60s 窗口内忽略）
       this._rememberSent(text);
+
+      // eos（团购中控台）专有流程：发送按钮是 div.button-*，空输入时带禁用态 class
+      // （button-disable-*），而 Vue 的禁用态在 nextTick 后才更新 → 填完立刻点可能点在禁用按钮上。
+      // 因此等一拍再点；若按钮仍禁用则退回 Enter（真实 placeholder 明确「Enter键发送」）。
+      // 最后由"输入框是否被清空"判断是否真的发出（只在没发出时才补动作，避免重复发送）。
+      if (Site.isEos()) {
+        var selfEos = this;
+        Utils.sleep(150).then(function () {
+          var btnEos = selfEos.findSendButton(input);
+          if (btnEos && !selfEos._isSendDisabled(btnEos)) Utils.clickEl(btnEos);
+          else Utils.pressEnter(input);
+          return Utils.sleep(600);
+        }).then(function () {
+          var el2 = selfEos.findCommentInput();
+          if (el2 && String(el2.value || "").trim()) log.warn("评论可能未发出，输入框仍有内容");
+        });
+        return true;
+      }
 
       // Strategy 1: try clicking the send button immediately
       var sendBtn = this.findSendButton();
@@ -595,18 +967,28 @@
         try {
           var btn = PageAPI.findSendButton();
           if (btn) { Utils.clickEl(btn); return; }
-          // try pressing Enter via multiple event types
-          ["keydown", "keypress", "keyup"].forEach(function (type) {
-            input.dispatchEvent(new KeyboardEvent(type, {
-              key: "Enter", code: "Enter", keyCode: 13, which: 13,
-              bubbles: true, cancelable: true,
-            }));
-          });
+          Utils.pressEnter(input);
         } catch (e) {
           console.error("[中控助手] sendComment async error:", e);
         }
       });
       return true;
+    },
+
+    // 输入框字数上限（取不到返回 0 = 未知）。eos 评论区实测 maxlength=50
+    commentMaxLength: function () {
+      var el = this.findCommentInput();
+      var n = el ? parseInt(el.getAttribute("maxlength"), 10) : NaN;
+      return isNaN(n) || n <= 0 ? 0 : n;
+    },
+
+    // 发送按钮是否处于禁用态（eos 用 class 表达禁用：button-disable-*）
+    _isSendDisabled: function (el) {
+      if (!el) return true;
+      var cls = typeof el.className === "string" ? el.className : "";
+      return el.disabled === true ||
+             el.getAttribute("aria-disabled") === "true" ||
+             cls.indexOf("disable") !== -1;
     },
 
     // ---------- 最近发送记录（识别"自己发的弹幕"，避免自触发循环） ----------
@@ -683,6 +1065,21 @@
     // 定位弹幕列表容器（5s 缓存 + 自愈重试）
     findDanmakuContainer: function (force) {
       var now = Date.now();
+      // eos（团购中控台）：评论区列表有稳定 id，直接取（比结构打分更可靠）
+      if (Site.isEos()) {
+        var eosListEl = document.getElementById("comment_all_tab_list_container");
+        if (eosListEl) {
+          // 评论区所在标签页/面板被隐藏时，脚本照跑但一条弹幕也看不到 →
+          // 提示一次（60s 节流），避免主人误以为"扩展坏了"
+          if (!Utils.isVisible(eosListEl) && now - (this._eosHiddenWarnAt || 0) > 60000) {
+            this._eosHiddenWarnAt = now;
+            log.warn("评论区当前不可见（请切到「全部」标签页或展开评论管理），弹幕监听暂不生效");
+          }
+          this._danmakuCache.container = eosListEl;
+          this._danmakuCache.checkedAt = now;
+          return eosListEl;
+        }
+      }
       var cached = this._danmakuCache.container;
       if (!force && cached && cached.isConnected && now - this._danmakuCache.checkedAt < 5000) {
         return cached;
@@ -720,6 +1117,8 @@
     // 中控台弹幕行结构：commentItem > nickname(含 tag 分类徽章) + description(内容文本)
     extractDanmaku: function (node) {
       if (!node || node.nodeType !== 1) return null;
+      // eos（团购中控台）评论区是另一套结构 → 走专属提取
+      if (Site.isEos()) return this._extractDanmakuEos(node);
       var t = (node.textContent || "").trim();
       if (!t || t.length > 200) return null;
 
@@ -748,6 +1147,32 @@
       var nickInfo = this._cleanNickname(nickname);
       return {
         text: t,
+        nickname: nickInfo.name,
+        content: content,
+        core: this._extractCore(content),
+        isSelf: nickInfo.isSelf,
+      };
+    },
+
+    // ---- eos（团购中控台）评论区行提取 ----
+    // 实测结构（2026-09-14）：
+    //   div.item-*
+    //   ├── span.tag-*           ← 系统标签（如"可能选品难"），不是昵称
+    //   ├── div.item-name-*      ← "昵称："（含尾部全角冒号）
+    //   └── div.item-content-*   ← 内容；系统消息（"xx浏览直播货架中"）没有此元素
+    _extractDanmakuEos: function (node) {
+      var nameEl = node.querySelector("[class*='item-name']");
+      if (!nameEl) return null;                                   // 不是评论行
+      var contentEl = node.querySelector("[class*='item-content']");
+      var content = contentEl ? (contentEl.textContent || "").trim() : "";
+      if (!content) return null;                                  // 系统消息 → 跳过
+      if (content.length > 200) return null;
+      var nickname = (nameEl.textContent || "").trim()
+        .replace(/[：:\s]+$/, "")                                 // 去尾部冒号（全角/半角）
+        .slice(0, 40);
+      var nickInfo = this._cleanNickname(nickname);
+      return {
+        text: nickname + "：" + content,
         nickname: nickInfo.name,
         content: content,
         core: this._extractCore(content),
@@ -792,13 +1217,49 @@
       // "我"/"主播我" → 主播自己发的消息（自问自答场景，应跳过）
       var selfOnly = raw.replace(/^(主播|管理员|助理)[·\s]*/, "");
       if (selfOnly === "我" || raw === "我") result.isSelf = true;
+      // eos：评论区不显示"我"，自己的消息显示为店铺账号名 → 用门店名反查
+      if (!result.isSelf && this._isOwnStoreName(raw)) result.isSelf = true;
       result.name = raw.trim().slice(0, 40);
       return result;
+    },
+
+    // 本店名缓存（eos）：从团购商品卡的门店名节点读取
+    _eosStoreName: "",
+    _eosStoreNameAt: 0,
+
+    // eos：评论昵称是否就是本店账号（自己发的评论不该触发自动回复）
+    _isOwnStoreName: function (nick) {
+      if (!Site.isEos()) return false;
+      if (!this._eosStoreName || Date.now() - this._eosStoreNameAt > 30000) {
+        // 门店名节点带 render-* 哈希类；实测它位于商品卡的门店行内：
+        //   [class*='poi-'] > [class*='text-leGBEX'] > [class*='render-nXrSFh']
+        // 先按实测结构精确命中；再退回全局扫描，并排除商品名节点（card-name 内）的候选，
+        // 否则商品行同名类会把"商品名"误当门店名
+        var storeExact = document.querySelector("[class*='poi-'] [class*='render-nXrSFh']");
+        var picked = storeExact ? (storeExact.textContent || "").trim() : "";
+        if (!picked) {
+          var cands = document.querySelectorAll("[class*='render-nXrSFh'], [class*='fictitious-gAsHPZ']");
+          for (var ci = 0; ci < cands.length; ci++) {
+            if (cands[ci].closest && cands[ci].closest("[class*='card-name']")) continue;
+            picked = (cands[ci].textContent || "").trim();
+            if (picked) break;
+          }
+        }
+        if (!picked) log.warn("未识别到本店门店名，自身评论可能被当作观众触发回复");
+        this._eosStoreName = picked;
+        this._eosStoreNameAt = Date.now();
+      }
+      var store = this._eosStoreName;
+      // 评论区昵称可能是门店名的子串（门店名带市名"汉中市…"，评论区不带）→ 双向包含判定
+      if (!store || !nick || nick.length < 4) return false;
+      return store.indexOf(nick) !== -1 || nick.indexOf(store) !== -1;
     },
 
     // 弹幕列表的真实滚动层（子容器），让 mutation 粒度更接近"弹幕行"；找不到返回原容器
     _resolveListContainer: function (container) {
       if (!container) return null;
+      // eos：评论区容器本身就是行级列表（子元素即评论行），不要往下钻
+      if (Site.isEos()) return container;
       if (this._scoreDanmakuContainer(container) >= 10) return container;
       var best = null, bestScore = 0;
       for (var i = 0; i < container.children.length; i++) {
@@ -809,16 +1270,21 @@
       return best || container;
     },
 
-    // 诊断：把候选弹幕容器信息输出到控制台，方便适配页面结构变化
+    // 诊断：把候选弹幕/评论区容器信息输出到控制台，方便适配页面结构变化
     dumpDanmakuCandidates: function () {
       try {
-        var cands = document.querySelectorAll("[class*='chat'],[class*='message'],[class*='comment'],[class*='danmaku'],[class*='interact'],[class*='webcast']");
+        var cands = document.querySelectorAll(
+          "[class*='chat'],[class*='message'],[class*='comment'],[class*='danmaku']," +
+          "[class*='interact'],[class*='webcast'],[id*='comment'],[id*='chat'],[id*='message']"
+        );
         var lines = [];
         for (var i = 0; i < Math.min(cands.length, 30); i++) {
           var el = cands[i];
-          lines.push(el.tagName.toLowerCase() + "." + this._cls(el).split(" ").slice(0, 3).join(".") + " 子元素:" + el.children.length);
+          lines.push(el.tagName.toLowerCase() +
+            (el.id ? ("#" + el.id) : ("." + this._cls(el).split(" ").slice(0, 3).join("."))) +
+            " 子元素:" + el.children.length);
         }
-        console.log("[中控助手] 弹幕候选容器:", lines);
+        console.log("[中控助手] 候选容器:", lines);
       } catch (_) {}
     },
   };
@@ -946,58 +1412,66 @@
         var pid = product.id || "?";
 
         // ---- single-product mode: explain → pause → explain → …
+        // 注：eos 虚拟列表场景下 clickExplain/cancelExplain 返回 Promise（先滚动渲染再点击），
+        // 这里统一用 Promise.resolve 兼容同步/异步两种返回值
         if (this._singleMode) {
-          var ok1;
-          var wasPhase = this._phase;
-          if (this._phase === "explain") {
+          var selfSingle = this;
+          var wasExplain = this._phase === "explain";
+          if (wasExplain) {
             log.info("讲解: " + pname + " [ID:" + pid + "]");
-            ok1 = PageAPI.clickExplain(product);
-            if (ok1) { this._failCount = 0; log.ok("已点击讲解: " + pname + " [ID:" + pid + "]"); }
-            else { this._failCount++; log.warn("未找到讲解按钮: " + pname + " [ID:" + pid + "]"); }
             this._phase = "pause";
           } else {
             log.info("暂停: " + pname + " [ID:" + pid + "]");
-            ok1 = PageAPI.cancelExplain(product);
-            if (ok1) { this._failCount = 0; log.ok("已取消讲解: " + pname + " [ID:" + pid + "]"); }
-            else { this._failCount++; log.warn("取消讲解失败: " + pname + " [ID:" + pid + "]"); }
             this._phase = "explain";
           }
-          if (this._failCount >= 3) {
-            log.err("连续 3 次操作失败，自动停止（页面结构可能已变化，请刷新后重试）");
-            this.stop();
-            return;
-          }
-          // pause phase → fixed 5s before explaining again; explain phase → interval
-          if (wasPhase === "pause") {
-            this._timer = setTimeout(this._doNext.bind(this), 5000);
-          } else {
-            this._scheduleNext(this.config.interval);
-          }
+          var action = wasExplain
+            ? PageAPI.clickExplain(product)
+            : PageAPI.cancelExplain(product);
+          Promise.resolve(action).then(function (ok1) {
+            if (!selfSingle.running) return;
+            if (ok1) {
+              selfSingle._failCount = 0;
+              log.ok((wasExplain ? "已点击讲解: " : "已取消讲解: ") + pname + " [ID:" + pid + "]");
+            } else {
+              selfSingle._failCount++;
+              log.warn((wasExplain ? "未找到讲解按钮: " : "取消讲解失败: ") + pname + " [ID:" + pid + "]");
+            }
+            if (selfSingle._failCount >= 3) {
+              log.err("连续 3 次操作失败，自动停止（页面结构可能已变化，请刷新后重试）");
+              selfSingle.stop();
+              return;
+            }
+            // 讲解阶段 → 按 interval；暂停阶段 → 固定 5s 后再讲解
+            if (wasExplain) selfSingle._scheduleNext(selfSingle.config.interval);
+            else selfSingle._timer = setTimeout(selfSingle._doNext.bind(selfSingle), 5000);
+          });
           return;
         }
 
         // ---- multi-product mode: explain each product in order
+        var selfMulti = this;
         log.info("讲解: " + pname + " [ID:" + pid + "]");
-        var ok = PageAPI.clickExplain(product);
-        if (ok) {
-          this._failCount = 0;
-          log.ok("已点击讲解: " + pname + " [ID:" + pid + "]");
-        } else {
-          this._failCount++;
-          log.warn("未找到讲解按钮: " + pname + " [ID:" + pid + "]");
-          if (this._failCount >= 3) {
-            log.err("连续 3 次操作失败，自动停止（页面结构可能已变化，请刷新后重试）");
-            this.stop();
-            return;
+        Promise.resolve(PageAPI.clickExplain(product)).then(function (ok) {
+          if (!selfMulti.running) return;
+          if (ok) {
+            selfMulti._failCount = 0;
+            log.ok("已点击讲解: " + pname + " [ID:" + pid + "]");
+          } else {
+            selfMulti._failCount++;
+            log.warn("未找到讲解按钮: " + pname + " [ID:" + pid + "]");
+            if (selfMulti._failCount >= 3) {
+              log.err("连续 3 次操作失败，自动停止（页面结构可能已变化，请刷新后重试）");
+              selfMulti.stop();
+              return;
+            }
           }
-        }
-
-        this._orderIndex++;
-        if (this._orderIndex >= this._order.length) {
-          this._order = []; // round complete → rebuilt with a fresh scan next time
-          this._rounds++;
-        }
-        this._scheduleNext();
+          selfMulti._orderIndex++;
+          if (selfMulti._orderIndex >= selfMulti._order.length) {
+            selfMulti._order = []; // round complete → rebuilt with a fresh scan next time
+            selfMulti._rounds++;
+          }
+          selfMulti._scheduleNext();
+        });
       } catch (e) {
         log.err("自动讲解出错: " + (e && e.message));
         this._failCount++;
@@ -1146,7 +1620,8 @@
       }
       var container = PageAPI.findDanmakuContainer(true);
       if (!container) {
-        log.err("弹幕回复：未找到弹幕列表容器，请确认直播中控台聊天区已打开");
+        log.err("弹幕回复：未找到" + (Site.isEos() ? "评论区" : "弹幕") + "列表容器，请确认" +
+          (Site.isEos() ? "团购中控台的评论区标签页已打开" : "直播中控台聊天区已打开"));
         PageAPI.dumpDanmakuCandidates();
         log.warn("候选容器信息已输出到控制台(F12)，把截图反馈给我即可适配");
         return;
@@ -1212,6 +1687,27 @@
     },
 
     _handleNode: function (node) {
+      // eos 评论区是 Vue 整块渲染：新增节点常常是"装着十几行的包裹容器"，
+      // 此时直接提取会取到"第一行的昵称 + 后面某一行的内容"这种错配 →
+      // 先把它拆成一行一行再处理（行本身命中时不做递归，避免自循环）
+      if (Site.isEos()) {
+        var listEl = PageAPI.findDanmakuContainer();
+        var nameEls = node.querySelectorAll("[class*='item-name']");
+        if (nameEls.length > 0 && listEl && listEl.contains(node)) {
+          var expanded = false;
+          for (var ri = 0; ri < nameEls.length; ri++) {
+            // 行 = 昵称节点向上走到"父节点就是评论容器"的那一层
+            // （不能用 closest('[class*=item-]')：item-name-*/item-content-* 也以 item- 开头）
+            var rowEl = nameEls[ri];
+            while (rowEl.parentElement && rowEl.parentElement !== listEl) rowEl = rowEl.parentElement;
+            if (rowEl.parentElement === listEl && rowEl !== node) {
+              this._handleNode(rowEl);
+              expanded = true;
+            }
+          }
+          if (expanded) return; // 已按行处理完毕
+        }
+      }
       var dm = PageAPI.extractDanmaku(node);
       if (!dm) return;
       // 忽略主播自己（"我"/"主播我"）的消息——自动回复在弹幕区也显示为"主播我"，一并规避自触发
@@ -1265,11 +1761,23 @@
         if (this.config.useNickname && reply.indexOf("{nickname}") !== -1) {
           reply = reply.replace(/\{nickname\}/g, dm.nickname);
         } else {
-          reply = "@" + dm.nickname + " " + reply;
+          reply = this._withNickname(reply, dm.nickname);
         }
       }
       this._queue.push({ reply: reply, nickname: dm.nickname });
       this._drainQueue();
+    },
+
+    // 拼 "@昵称 " 前缀。输入框有字数上限时（eos 评论区实测 50 字）优先保证回复完整：
+    // 放不下就省略 @，否则会被截断成半句话（省略会打日志，便于主人判断是否要改规则）
+    _withNickname: function (reply, nickname) {
+      var composed = "@" + nickname + " " + reply;
+      var max = PageAPI.commentMaxLength();
+      if (max > 0 && composed.length > max) {
+        log.warn("输入框限 " + max + " 字，本条省略 @昵称 以保证回复完整：" + reply);
+        return reply;
+      }
+      return composed;
     },
 
     _drainQueue: function () {
@@ -1362,7 +1870,7 @@
 
       // Scan products on open
       this.refreshProducts();
-      log.info("抖音直播中控助手已加载");
+      log.info("中控助手已加载 · 站点：" + Site.label());
       log.info("页面: " + (Probe.getPageType() || "未知"));
       if (Probe.hasVue()) log.ok("检测到 Vue " + (Probe.getVue().version || "") + " 应用");
 
@@ -1378,7 +1886,7 @@
 
       panel.innerHTML =
         '<div id="dy-panel-header">' +
-          '<span class="title">🎯 直播中控助手</span>' +
+          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + (Site.isEos() ? "团购" : "直播") + '中控助手</span>' +
           '<span class="min-btn" id="dy-min-btn">_</span>' +
         '</div>' +
         '<div id="dy-panel-tabs">' +
@@ -1758,6 +2266,8 @@
             autoExplainRunning: AutoExplain.running,
             autoCommentRunning: AutoComment.running,
             autoReplyRunning: AutoReply.running,
+            site: Site.detect(),
+            siteLabel: Site.label(),
             productCount: (PageAPI._cache.products || []).length,
             explainRounds: AutoExplain._rounds,
             replyStats: AutoReply.getStats(),
@@ -1771,8 +2281,19 @@
       result = { success: false, error: err.message };
     }
 
-    // 回传结果
-    window.postMessage({ source: "zkb-response", id: id, result: result }, "*");
+    // 回传结果（result 可能是同步对象，也可能是 Promise → 统一等结算后再回传）
+    Promise.resolve(result).then(
+      function (r) {
+        window.postMessage({ source: "zkb-response", id: id, result: r }, "*");
+      },
+      function (err) {
+        window.postMessage({
+          source: "zkb-response",
+          id: id,
+          result: { success: false, error: String((err && err.message) || err) },
+        }, "*");
+      }
+    );
   });
 
   function _doExplain(index, cancel) {
@@ -1785,13 +2306,19 @@
       return { success: false, error: "index 超范围 (0-" + (products.length - 1) + ")" };
     }
     var product = products[idx];
-    var ok = cancel ? PageAPI.cancelExplain(product) : PageAPI.clickExplain(product);
-    return {
-      success: ok,
-      index: idx,
-      name: product.name,
-      action: cancel ? "cancel_explain" : "explain",
-    };
+    var act = cancel ? "cancel_explain" : "explain";
+    // 站点差异（虚拟列表 vs 全量渲染）内聚在 PageAPI 内，对调用方统一成 Promise<boolean>：
+    //   buyin → 同步 boolean；eos → Promise（先滚动渲染出目标行再点击）
+    // 直接把 Promise 当 success 返回会因 postMessage 无法结构化克隆而抛错，故这里收口。
+    var pending = cancel ? PageAPI.cancelExplain(product) : PageAPI.clickExplain(product);
+    return Promise.resolve(pending).then(function (ok) {
+      return {
+        success: !!ok,
+        index: idx,
+        name: product.name,
+        action: act,
+      };
+    });
   }
 
   function _listProducts() {
@@ -1832,11 +2359,9 @@
     Panel.init();
   }
 
-  // Check that we're on the supported page (douyin live control center)
+  // Check that we're on a supported page (live control / group-buy live control)
   function isSupportedPage() {
-    var host = window.location.host;
-    var path = window.location.pathname || "";
-    return host === "buyin.jinritemai.com" && path.indexOf("/dashboard/live/control") === 0;
+    return Site.supported();
   }
 
   if (isSupportedPage()) {

@@ -136,8 +136,16 @@
   scanVue();
 
   // ====================== 4. Detect page type ======================
-  // The extension only runs on the buyin live control page.
-  P.pageType = "buyin-control";
+  // The extension runs on both Douyin consoles (live control / group-buy control).
+  var _ptHost = window.location.host;
+  var _ptPath = window.location.pathname || "";
+  if (_ptHost === "eos.douyin.com" && _ptPath.indexOf("/livesite/live/current") === 0) {
+    P.pageType = "eos-groupon-control";
+  } else if (_ptHost === "buyin.jinritemai.com" && _ptPath.indexOf("/dashboard/live/control") === 0) {
+    P.pageType = "buyin-control";
+  } else {
+    P.pageType = "unknown";
+  }
 
   // ====================== 5. Mark ready ======================
   P.ready = true;
