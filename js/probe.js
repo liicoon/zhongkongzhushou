@@ -136,13 +136,15 @@
   scanVue();
 
   // ====================== 4. Detect page type ======================
-  // The extension runs on both Douyin consoles (live control / group-buy control).
+  // The extension runs on three Douyin/Doudian consoles.
   var _ptHost = window.location.host;
   var _ptPath = window.location.pathname || "";
   if (_ptHost === "eos.douyin.com" && _ptPath.indexOf("/livesite/live/current") === 0) {
     P.pageType = "eos-groupon-control";
   } else if (_ptHost === "buyin.jinritemai.com" && _ptPath.indexOf("/dashboard/live/control") === 0) {
     P.pageType = "buyin-control";
+  } else if (_ptHost === "fxg.jinritemai.com" && _ptPath.indexOf("/ffa/content-tool/live/control") === 0) {
+    P.pageType = "fxg-doudian-control";
   } else {
     P.pageType = "unknown";
   }

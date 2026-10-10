@@ -125,16 +125,20 @@
 
   // ========================================================================
   //  SITE PROFILE – 多站点适配（直播中控台 / 团购中控台）
-  //  两个站点的前端组件库完全不同，用"站点档案"把差异集中收口在这里，
+  //  三个站点的前端组件库不完全相同，用"站点档案"把差异集中收口在这里，
   //  其余模块只问 Site 是哪个站，不散落 host 判断：
-  //    buyin  buyin.jinritemai.com/dashboard/live/control  商品=goodsItem 行（全量渲染）
-  //    eos    eos.douyin.com/livesite/live/current         商品=虚拟滚动 list-wrap，评论=评论区
+  //    buyin  buyin.jinritemai.com/dashboard/live/control      商品=goodsItem 行（全量渲染）
+  //    eos    eos.douyin.com/livesite/live/current             商品=虚拟滚动 list-wrap，评论=评论区
+  //    fxg    fxg.jinritemai.com/ffa/content-tool/live/control 抖店中控台：**与 buyin 同源**
+  //           （2026-09-30 用真实 DOM 实测：同 id #comment-list-wrapper、同行结构
+  //             commentItem/nickname/description、同 tag-a4f4ec 哈希 → 复用 buyin 分支即可）
   // ========================================================================
   var Site = {
     _id: null,
     PROFILES: [
       { id: "buyin", host: "buyin.jinritemai.com", path: "/dashboard/live/control", label: "直播中控台" },
       { id: "eos", host: "eos.douyin.com", path: "/livesite/live/current", label: "团购中控台" },
+      { id: "fxg", host: "fxg.jinritemai.com", path: "/ffa/content-tool/live/control", label: "抖店中控台" },
     ],
     detect: function () {
       if (this._id) return this._id;
@@ -148,6 +152,7 @@
       return this._id;
     },
     isEos: function () { return this.detect() === "eos"; },
+    isFxg: function () { return this.detect() === "fxg"; },
     supported: function () { return this.detect() !== "unknown"; },
     label: function () {
       var id = this.detect();
@@ -155,6 +160,11 @@
         if (this.PROFILES[i].id === id) return this.PROFILES[i].label;
       }
       return "未知站点";
+    },
+    // 面板标题用的站点简称（buyin 保持原来的"直播"，老站点观感不变）
+    short: function () {
+      var id = this.detect();
+      return id === "eos" ? "团购" : (id === "fxg" ? "抖店" : "直播");
     },
   };
 
@@ -290,7 +300,16 @@
 
       // does the text look like a metrics/summary blob rather than a product name?
       // (e.g. "¥2.60到手价0告出¥0.00成交金额0.00%曝光成交率")
-      function isLikelyMetrics(text) {
+      //
+      // ⚠️ 判据只能是「汉字为主 vs 数字/符号为主」，绝不能是「首位是不是数字」——
+      //    2026-10-08 实测踩到：商品名「26年<品类>…」以**年份**开头，
+      //    被旧的 `/^[¥￥\d]/` 整条判成指标串丢掉 → 商品名变空 → 面板显示「未知商品」
+      //    （但讲解按钮照点，所以只在"商品获取"上出错，不报任何错）。
+      //    凡是"以数字打头就否决"的规则，都会误杀「年份/规格/数字型号」打头的真实商品名。
+      //
+      // strict=true：额外把「数字打头」也当可疑。**只给第 3 步的整行文本兜底用** ——
+      //   那里拿到的是 "10:26:4826年黑米…" 这种整行拼接串，数字打头确实是垃圾特征。
+      function isLikelyMetrics(text, strict) {
         var hits = ["到手价", "成交", "金额", "曝光", "转化", "销量", "观看", "订单",
           "佣金", "退款", "退货", "库存", "价格", "优惠", "利润", "人气", "点击",
           "件数", "客单", "讲解"];
@@ -298,7 +317,10 @@
         for (var i = 0; i < hits.length; i++) {
           if (text.indexOf(hits[i]) !== -1) n++;
         }
-        return n >= 2 || /^[¥￥\d]/.test(text);
+        if (n >= 2) return true;                          // 命中 ≥2 个指标词 → 铁定是指标串
+        if (/^[¥￥]/.test(text)) return true;             // 货币符号打头 → 金额串
+        if (strict && /^[\d¥￥]/.test(text)) return true; // 整行拼接串：数字打头即可疑
+        return !/[\u4e00-\u9fa5]/.test(text);             // 一个汉字都没有 → 不可能是商品名
       }
 
       // extract the product name from a row
@@ -331,7 +353,7 @@
         // 3. fallback only if it doesn't look like metrics garbage
         if (!best) {
           var fb = (row.textContent || "").substring(0, 60).trim();
-          return isLikelyMetrics(fb) ? "" : fb;
+          return isLikelyMetrics(fb, true) ? "" : fb;  // strict：整行拼接串放宽无关，收紧才安全
         }
         return best;
       }
@@ -378,8 +400,13 @@
     // Collect goods rows. Known page structure (from DevTools):
     //   <div class="goodsItem-xxxx rpa_lc__live-goods__goods-item"
     //        data-rbd-draggable-id="3753668893483336118" ...>
-    // The whole list is rendered (absolute-positioned rows, NOT virtualized),
-    // so a page-wide class match is both fast and reliable.
+    // 页面全量渲染（行是绝对定位，无 data-index），所以按 class 全文档匹配既快又可靠。
+    // fxg 的列表容器也是这套结构：
+    //   #live-control-goods-list-container > div{overflow:auto; will-change:transform}
+    //   > div{height:...} + 行{position:absolute; top:0/216; height:208}
+    //   看着像虚拟滚动，但 2026-09-30 主人确认「商品只有 2 个」→ 撑高容器 432px
+    //   就是实际行数（432 = 2×216），全量渲染成立，**无需 eos 那样的滚动渲染逻辑**。
+    //   （若将来商品变多、发现扫不全，再照 _scanProductsEos 补滚动。）
     _collectRows: function () {
       var rows = [];
       var exact = document.querySelectorAll(
@@ -410,15 +437,24 @@
     },
 
     // Find the "讲解" button inside a row.
-    // Known page structure (from DevTools):
-    //   <button class="lvc2-grey-btn ..." style="...">讲解</button>
+    // Known page structures (from DevTools):
+    //   buyin 老结构: <button class="lvc2-grey-btn" ...>讲解</button>
+    //   fxg / doudian: <button class="auxo-btn auxo-btn-sm lvc2-doudian-btn
+    //                          [active] greyBtnStyle-<hash>">讲解 / 取消讲解</button>
+    //   ⚠️ 同一行还有 预热 / 营销活动 / 下架 / 更多数据 等兄弟按钮，文本不匹配 → 必须配合文本判定
     _findExplainBtnInRow: function (row) {
       if (!row || !row.querySelectorAll) return null;
       // eos（团购中控台）：讲解按钮是 div[class*='talking-btn']（不是 button，
       // 通用扫描抓不到），用专属选择器一步定位；取不到即说明该行不是商品行
       if (Site.isEos()) return this.eosExplainBtn(row);
       // 1. known component class first (most reliable)
-      var known = row.querySelectorAll("button.lvc2-grey-btn, button[class*='grey-btn'], button[class*='GreyBtn']");
+      //    greyBtnStyle-* 是 2026-09-30 实测的 fxg（抖店中控台）灰色按钮特征 —— 驼峰、无连字符，
+      //    原来那三个选择器（lvc2-grey-btn / grey-btn / GreyBtn）在 fxg 上一个都不命中，
+      //    定位全靠第 2 步文本扫描兜底。补上它，让"可靠特征优先"这层防线真正生效。旧选择器保留，兼容老站点。
+      var known = row.querySelectorAll(
+        "button.lvc2-grey-btn, button[class*='grey-btn'], button[class*='GreyBtn'], " +
+        "button[class*='greyBtnStyle']"
+      );
       for (var i = 0; i < known.length; i++) {
         var t0 = (known[i].textContent || "").trim();
         if (Utils.isExplainBtnText(t0)) return known[i];
@@ -446,7 +482,7 @@
     //               ├── [class*='drag-number'] input.sort-input-*   ← 序号（maxlength=2，1-based）
     //               ├── [class*='card-name'] [class*='render-1']    ← 商品名
     //               │   （同名文本还有 [class*='fictitious-*'] 量宽副本，不能用）
-    //               ├── [class*='poi-'] [class*='render-nXrSFh']    ← 门店名"汉中市周大黑…"
+    //               ├── [class*='poi-'] [class*='render-nXrSFh']    ← 门店名"XX市<门店>…"
     //               ├── [class*='operate-area'] [class*='talking-btn'] [class*='talking-word']
     //               │                                                ← "讲解" / "取消讲解"
     //               └── [class*='stats-'] 曝光/点击/支付订单数/销售额
@@ -797,6 +833,20 @@
         if (!eosInput) log.warn("未找到评论输入框（评论区面板是否收起？）");
         return eosInput || null;
       }
+      // Strategy 0（buyin / fxg 共用）：中控台评论输入区有稳定 id `input-comment-block-id`，
+      // 用它锚定最可靠。为什么不用通用的 `textarea[class*='input']`？—— 2026-09-30 用 fxg 真实
+      // DOM 实测：页面上还有别的同类输入框（商品搜索），一旦它排在评论输入框**之前**就会被先
+      // 命中，回复会打进搜索框（与 eos 的 input-wrap 串台同型，静默失效、极难排查）。
+      // 校验三件事才采用：① 锚点内确实是 textarea ② 该 textarea 可见 ③ 同一锚点内有
+      // inputSuffix 发送按钮。任一不满足 → 原样回退到下面的策略，buyin 现有行为不受影响。
+      var anchorEl = document.getElementById("input-comment-block-id");
+      if (anchorEl) {
+        var anchoredInput = anchorEl.querySelector("textarea");
+        if (anchoredInput && anchoredInput.offsetParent !== null &&
+            anchorEl.querySelector("[class*='inputSuffix'], [class*='input-suffix']")) {
+          return anchoredInput;
+        }
+      }
       // Look for chat input area
       var selectors = [
         "textarea[class*='chat']", "textarea[class*='comment']",
@@ -849,6 +899,22 @@
           var eosBtn = eosScope.querySelector("[class*='button-']");
           if (eosBtn && (eosBtn.textContent || "").trim().indexOf("发送") !== -1) return eosBtn;
           eosScope = eosScope.parentElement;
+        }
+      }
+
+      // Strategy 0（buyin / fxg 共用）：与输入框同一个稳定 id 锚点内取 inputSuffix。
+      // 这里**刻意不复用**下面的"宽度 < 200"启发式 —— 2026-09-30 实测该判据不可靠：
+      // 无 CSS（或页面上存在更宽的同类元素）时真发送按钮会被判掉，返回 null。
+      // 锚点 + 文本白名单已经足够精确。
+      var sendAnchor = document.getElementById("input-comment-block-id");
+      if (sendAnchor) {
+        var aSuf = sendAnchor.querySelectorAll("[class*='inputSuffix'], [class*='input-suffix']");
+        for (var ai = 0; ai < aSuf.length; ai++) {
+          var aTxt = (aSuf[ai].textContent || "").trim();
+          if (!aTxt || aSuf[ai].offsetParent === null) continue;
+          for (var aj = 0; aj < texts.length; aj++) {
+            if (aTxt === texts[aj] || aTxt.indexOf(texts[aj]) !== -1) return aSuf[ai];
+          }
         }
       }
 
@@ -935,19 +1001,20 @@
       // 记录本次发送文本，供弹幕监听识别"自己发的弹幕"（60s 窗口内忽略）
       this._rememberSent(text);
 
-      // eos（团购中控台）专有流程：发送按钮是 div.button-*，空输入时带禁用态 class
-      // （button-disable-*），而 Vue 的禁用态在 nextTick 后才更新 → 填完立刻点可能点在禁用按钮上。
-      // 因此等一拍再点；若按钮仍禁用则退回 Enter（真实 placeholder 明确「Enter键发送」）。
+      // eos（团购中控台）+ fxg（抖店中控台）专有发送流程：发送按钮是 div（不是 button），
+      // 空输入时带禁用态 class（eos: button-disable-* / fxg: isDisabled-*），
+      // 而 Vue 的禁用态在 nextTick 后才更新 → 填完立刻点可能点在禁用按钮上。
+      // 因此等一拍再点；若按钮仍禁用则退回 Enter（两个站的 placeholder 都写明「Enter键发送」）。
       // 最后由"输入框是否被清空"判断是否真的发出（只在没发出时才补动作，避免重复发送）。
-      if (Site.isEos()) {
-        var selfEos = this;
+      if (Site.isEos() || Site.isFxg()) {
+        var selfSend = this;
         Utils.sleep(150).then(function () {
-          var btnEos = selfEos.findSendButton(input);
-          if (btnEos && !selfEos._isSendDisabled(btnEos)) Utils.clickEl(btnEos);
+          var btnNow = selfSend.findSendButton(input);
+          if (btnNow && !selfSend._isSendDisabled(btnNow)) Utils.clickEl(btnNow);
           else Utils.pressEnter(input);
           return Utils.sleep(600);
         }).then(function () {
-          var el2 = selfEos.findCommentInput();
+          var el2 = selfSend.findCommentInput();
           if (el2 && String(el2.value || "").trim()) log.warn("评论可能未发出，输入框仍有内容");
         });
         return true;
@@ -982,10 +1049,13 @@
       return isNaN(n) || n <= 0 ? 0 : n;
     },
 
-    // 发送按钮是否处于禁用态（eos 用 class 表达禁用：button-disable-*）
+    // 发送按钮是否处于禁用态（页面上用 class 表达禁用：eos 是 button-disable-*，
+    // fxg / 抖店是 isDisabled-* **驼峰**）→ 必须**大小写不敏感**。
+    // 否则 fxg 的禁用态认不出来，会以为按钮可点而空点一下（表现为"自动回复没发出去"）。
+    // 无副作用的写法：只把 class 转小写再找，命中范围只增不减（原 eos/buyin 判定不变）。
     _isSendDisabled: function (el) {
       if (!el) return true;
-      var cls = typeof el.className === "string" ? el.className : "";
+      var cls = typeof el.className === "string" ? el.className.toLowerCase() : "";
       return el.disabled === true ||
              el.getAttribute("aria-disabled") === "true" ||
              cls.indexOf("disable") !== -1;
@@ -1333,6 +1403,7 @@
         if (!indices || indices.length === 0) {
           log.warn("指定的商品序号无效");
           this.running = false;
+          Panel._syncRunState(); // 启动失败回滚 → 按钮跟随真实状态
           return;
         }
         products = [];
@@ -1349,6 +1420,7 @@
       log.ok("自动讲解已启动，共 " + this._order.length + " 个商品，间隔 " +
         this.config.interval + "s ± " + this.config.randomDelay + "s" +
         (this.config.shuffle ? "，打乱顺序" : "，按序号顺序"));
+      Panel._syncRunState();
       this._doNext();
     },
 
@@ -1356,6 +1428,7 @@
       this.running = false;
       if (this._timer) { clearTimeout(this._timer); this._timer = null; }
       log.info("自动讲解已停止");
+      Panel._syncRunState();
     },
 
     // build the play order for one round: sequential, or Fisher–Yates shuffled
@@ -1522,6 +1595,7 @@
       this._msgIndex = 0;
       this._failCount = 0;
       log.ok("自动发评已启动，共 " + this.config.messages.length + " 条消息，间隔 " + this.config.interval + "s ± " + this.config.randomDelay + "s");
+      Panel._syncRunState();
       this._doNext();
     },
 
@@ -1529,6 +1603,7 @@
       this.running = false;
       if (this._timer) { clearTimeout(this._timer); this._timer = null; }
       log.info("自动发评已停止");
+      Panel._syncRunState();
     },
 
     _doNext: function () {
@@ -1616,6 +1691,7 @@
       if (this.running) return;
       if (!this.rules || this.rules.length === 0) {
         log.warn("弹幕回复：请先配置关键词规则（每行：关键词|关键词 => 回复内容）");
+        Panel._syncRunState();
         return;
       }
       var container = PageAPI.findDanmakuContainer(true);
@@ -1624,6 +1700,7 @@
           (Site.isEos() ? "团购中控台的评论区标签页已打开" : "直播中控台聊天区已打开"));
         PageAPI.dumpDanmakuCandidates();
         log.warn("候选容器信息已输出到控制台(F12)，把截图反馈给我即可适配");
+        Panel._syncRunState();
         return;
       }
       this.running = true;
@@ -1643,6 +1720,7 @@
       log.ok("弹幕回复已启动，监听中（命中关键词自动回复）");
       log.info("弹幕容器: <" + this._container.tagName.toLowerCase() + (PageAPI._cls(this._container) ? " class='" + PageAPI._cls(this._container).slice(0, 60) + "'" : "") + ">");
       log.info("规则 " + this.rules.length + " 条，命中后延迟 " + this.config.delayMin + "~" + this.config.delayMax + "s 回复，同用户冷却 " + this.config.userCooldown + "s，上限 " + this.config.maxPerMinute + " 条/分钟");
+      Panel._syncRunState();
     },
 
     stop: function () {
@@ -1653,6 +1731,7 @@
       this._queue = [];
       this._sending = false;
       log.info("弹幕回复已停止");
+      Panel._syncRunState();
     },
 
     setConfig: function (cfg) {
@@ -1865,6 +1944,9 @@
       this._bindControls();
       this._loadSavedConfig();
 
+      // 初始状态同步：若模块已在运行（面板重建 / 拖拽后被重挂），按钮与 tab 点立即跟上
+      this._syncRunState();
+
       // Init log console reference
       log.init(document.getElementById("dy-console"));
 
@@ -1886,7 +1968,7 @@
 
       panel.innerHTML =
         '<div id="dy-panel-header">' +
-          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + (Site.isEos() ? "团购" : "直播") + '中控助手</span>' +
+          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + Site.short() + '中控助手</span>' +
           '<span class="min-btn" id="dy-min-btn">_</span>' +
         '</div>' +
         '<div id="dy-panel-tabs">' +
@@ -2048,6 +2130,7 @@
           indices: self._val("dy-explain-indices"),
         });
         AutoExplain.start(self._val("dy-explain-indices"));
+        Panel._syncRunState(); // start 可能提前失败返回 → 以真实 running 为准
       });
       this._onClick("dy-explain-stop", function () { AutoExplain.stop(); });
 
@@ -2073,6 +2156,7 @@
         } catch (e) {
           log.err("启动自动发评失败: " + e.message);
         }
+        Panel._syncRunState(); // 含异常分支：始终以真实 running 为准
       });
       this._onClick("dy-comment-stop", function () { AutoComment.stop(); });
 
@@ -2087,6 +2171,7 @@
         } catch (e) {
           log.err("启动弹幕回复失败: " + e.message);
         }
+        Panel._syncRunState(); // 含异常分支：始终以真实 running 为准
       });
       this._onClick("dy-reply-stop", function () { AutoReply.stop(); });
 
@@ -2214,6 +2299,53 @@
       if (!el) return;
       var s = AutoReply.getStats();
       el.textContent = "命中 " + s.matched + " / 回复 " + s.replied;
+    },
+
+    // ----------------------------------------------------------------------
+    //  运行状态同步（单一数据源 → UI）
+    //  三组「开始/停止」按钮与 tab 状态点，全部由模块的 running 驱动。
+    //  任何改变 running 的路径（点击 / 自动停止 / 启动失败回滚）都必须调用本函数，
+    //  保证「按钮永远不会说谎」。
+    // ----------------------------------------------------------------------
+    _runState: null,
+
+    _syncRunState: function () {
+      // 注意：AutoExplain 等是本 IIFE 内的 var 声明，**不会**挂到 window 上，
+      // 必须直接引用标识符（写成 window.AutoExplain 会恒为 undefined → 状态永远同步不上）
+      var states = {
+        explain: !!(typeof AutoExplain !== "undefined" && AutoExplain.running),
+        comment: !!(typeof AutoComment !== "undefined" && AutoComment.running),
+        reply: !!(typeof AutoReply !== "undefined" && AutoReply.running),
+      };
+      Panel._runState = states;
+
+      var self = this;
+      Object.keys(states).forEach(function (key) {
+        var on = states[key];
+        var startBtn = document.getElementById("dy-" + key + "-start");
+        var stopBtn = document.getElementById("dy-" + key + "-stop");
+
+        // 开始按钮：运行中 → 绿色高亮 + 文案变「运行中」
+        if (startBtn) {
+          var baseText = startBtn.getAttribute("data-base-text");
+          if (!baseText) {
+            // 首次同步时记住原始文案（「▶ 开始」/「▶ 监听」），避免反复改写后丢失
+            baseText = startBtn.textContent;
+            startBtn.setAttribute("data-base-text", baseText);
+          }
+          startBtn.classList.toggle("running", on);
+          startBtn.textContent = on ? "● 运行中" : baseText;
+        }
+
+        // 停止按钮：运行中才可点；停止态降透明度，形成明确互斥
+        if (stopBtn) {
+          stopBtn.disabled = !on;
+        }
+
+        // tab 状态点：切到其他 tab 也能看到哪个模块在跑
+        var tab = self._el && self._el.querySelector('.tab[data-tab="' + key + '"]');
+        if (tab) tab.classList.toggle("running", on);
+      });
     },
   };
 

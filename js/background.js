@@ -5,6 +5,7 @@
 var CONTROL_URLS = [
   "https://buyin.jinritemai.com/dashboard/live/control*",
   "https://eos.douyin.com/livesite/live/current*",
+  "https://fxg.jinritemai.com/ffa/content-tool/live/control*",
 ];
 
 // 监听来自 bridge.js content script 的消息

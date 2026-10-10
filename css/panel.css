@@ -67,6 +67,24 @@
   border-bottom-color: #89b4fa;
 }
 
+/* 运行中的模块：tab 上打一个绿点（无需切 tab 就能看到谁在跑） */
+#dy-panel-tabs .tab.running::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: #a6e3a1;
+  vertical-align: middle;
+  box-shadow: 0 0 5px rgba(166,227,161,.9);
+  animation: dy-pulse 1.6s ease-in-out infinite;
+}
+@keyframes dy-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .35; }
+}
+
 /* ===== Tab Content ===== */
 #dy-panel-body {
   padding: 0;
@@ -156,6 +174,25 @@
 .dy-btn:active { transform: scale(.97); }
 .dy-btn.small { padding: 3px 10px !important; font-size: 11px !important; }
 .dy-btn:disabled { opacity: .4 !important; cursor: not-allowed !important; pointer-events: auto !important; }
+
+/* ===== 运行状态：开始按钮高亮（绿色 = 正在运行） ===== */
+/* 由 Panel._syncRunState() 依据模块真实 running 切换，任何停止路径都会还原 */
+/* 注意：本块必须排在 .dy-btn:not(:disabled) 之后，否则同优先级会被后来的规则覆盖 */
+.dy-btn.running {
+  background: #a6e3a1 !important;
+  color: #1e1e2e !important;
+  font-weight: 600 !important;
+  box-shadow: 0 0 0 2px rgba(166,227,161,.25) !important;
+  opacity: 1 !important;
+}
+.dy-btn.running:hover { background: #94d68f !important; }
+/* 运行中的按钮不再重复响应 primary 的蓝色悬停 */
+.dy-btn.running.primary:hover { background: #94d68f !important; }
+
+/* 停止按钮（非 primary）在可点/禁用两态下的底色 —— 只作用于停止按钮，避免与 .running 抢优先级 */
+.dy-btn.small:not(.primary) { background: #585b70 !important; }
+.dy-btn.small:not(.primary):disabled { opacity: .35 !important; }
+.dy-btn.small:not(.primary):not(:disabled):hover { background: #6c7086 !important; }
 
 /* ===== Toggle Switch ===== */
 .dy-toggle {

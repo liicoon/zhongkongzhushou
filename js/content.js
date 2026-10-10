@@ -20,13 +20,17 @@
   var PATH = window.location.pathname || "";
 
   // Supported consoles:
-  //   buyin.jinritemai.com/dashboard/live/control   抖音直播中控台
-  //   eos.douyin.com/livesite/live/current          抖音团购中控台
+  //   buyin.jinritemai.com/dashboard/live/control      抖音直播中控台
+  //   eos.douyin.com/livesite/live/current             抖音团购中控台
+  //   fxg.jinritemai.com/ffa/content-tool/live/control 抖店直播中控台（与 buyin 同源）
   // (manifest matches already restrict this script — double-check here so a
   // future manifest change cannot silently widen the blast radius.)
+  // 注意用 pathname（不含 ? 查询串）判断：抖店入口 URL 常带 btm_* 埋点参数，
+  // 那些参数每次点击都不同，不能参与站点判断。
   var SUPPORTED =
     (HOST === "buyin.jinritemai.com" && PATH.indexOf("/dashboard/live/control") === 0) ||
-    (HOST === "eos.douyin.com" && PATH.indexOf("/livesite/live/current") === 0);
+    (HOST === "eos.douyin.com" && PATH.indexOf("/livesite/live/current") === 0) ||
+    (HOST === "fxg.jinritemai.com" && PATH.indexOf("/ffa/content-tool/live/control") === 0);
 
   if (SUPPORTED) {
     injectCSS("css/panel.css");

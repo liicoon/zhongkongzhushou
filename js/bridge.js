@@ -5,13 +5,15 @@
   "use strict";
 
   // 中控页不需要这个桥接（content.js 已处理）
-  //   buyin.jinritemai.com/dashboard/live/control  抖音直播中控台
-  //   eos.douyin.com/livesite/live/current         抖音团购中控台
+  //   buyin.jinritemai.com/dashboard/live/control      抖音直播中控台
+  //   eos.douyin.com/livesite/live/current             抖音团购中控台
+  //   fxg.jinritemai.com/ffa/content-tool/live/control 抖店直播中控台
   var _zkbHost = window.location.host;
   var _zkbPath = window.location.pathname || "";
   if (
     (_zkbHost === "buyin.jinritemai.com" && _zkbPath.indexOf("/dashboard/live/control") === 0) ||
-    (_zkbHost === "eos.douyin.com" && _zkbPath.indexOf("/livesite/live/current") === 0)
+    (_zkbHost === "eos.douyin.com" && _zkbPath.indexOf("/livesite/live/current") === 0) ||
+    (_zkbHost === "fxg.jinritemai.com" && _zkbPath.indexOf("/ffa/content-tool/live/control") === 0)
   ) {
     return;
   }
