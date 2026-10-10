@@ -1320,7 +1320,7 @@
         this._eosStoreNameAt = Date.now();
       }
       var store = this._eosStoreName;
-      // 评论区昵称可能是门店名的子串（门店名带市名"汉中市…"，评论区不带）→ 双向包含判定
+      // 评论区昵称可能是门店名的子串（门店名带行政区前缀如"XX市…"，评论区不带）→ 双向包含判定
       if (!store || !nick || nick.length < 4) return false;
       return store.indexOf(nick) !== -1 || nick.indexOf(store) !== -1;
     },
