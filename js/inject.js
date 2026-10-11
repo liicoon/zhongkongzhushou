@@ -132,6 +132,12 @@
   //    fxg    fxg.jinritemai.com/ffa/content-tool/live/control 抖店中控台：**与 buyin 同源**
   //           （2026-09-30 用真实 DOM 实测：同 id #comment-list-wrapper、同行结构
   //             commentItem/nickname/description、同 tag-a4f4ec 哈希 → 复用 buyin 分支即可）
+  //    wxch   channels.weixin.qq.com/platform/live/*            视频号直播中控台：
+  //           ⚠️ **弹幕与商品在不同的页面**（能力完全不重叠，2026-10-10 实测：
+  //              弹幕页 0 处讲解/价格，商品页 0 处评论/发送），所以同一个站点 id 下
+  //              有**两条 path**，再用 Site.page() 区分页级能力。技术栈是
+  //              Ant Design(Vue2) + weui-desktop，与前三个站点（lvc2/auxo/rbd）完全不同源，
+  //              选择器一个都不能复用 → 各链路的 wxch 分支都是独立实现。
   // ========================================================================
   var Site = {
     _id: null,
@@ -139,6 +145,9 @@
       { id: "buyin", host: "buyin.jinritemai.com", path: "/dashboard/live/control", label: "直播中控台" },
       { id: "eos", host: "eos.douyin.com", path: "/livesite/live/current", label: "团购中控台" },
       { id: "fxg", host: "fxg.jinritemai.com", path: "/ffa/content-tool/live/control", label: "抖店中控台" },
+      // 用**精确 path** 而不是公共前缀 /platform/live/：那会把视频号后台其它 live 子页也吸进来
+      { id: "wxch", host: "channels.weixin.qq.com", path: "/platform/live/liveBuild", label: "视频号中控台" },
+      { id: "wxch", host: "channels.weixin.qq.com", path: "/platform/live/commodity/onsale/index", label: "视频号中控台" },
     ],
     detect: function () {
       if (this._id) return this._id;
@@ -153,6 +162,31 @@
     },
     isEos: function () { return this.detect() === "eos"; },
     isFxg: function () { return this.detect() === "fxg"; },
+    isWxch: function () { return this.detect() === "wxch"; },
+    // 页级区分（只有视频号需要）：视频号把「弹幕」和「商品」拆成两个页面，
+    // 能力不重叠 → 面板与各链路都要按页裁剪。其它站点是单页全能，返回 ""。
+    //   "comment" 弹幕页  /platform/live/liveBuild           → 自动发评 / 弹幕回复
+    //   "goods"   商品页  /platform/live/commodity/onsale/index → 自动讲解（本轮不建面板）
+    page: function () {
+      if (!this.isWxch()) return "";
+      var path = window.location.pathname || "";
+      if (path.indexOf("/platform/live/commodity/onsale/index") === 0) return "goods";
+      if (path.indexOf("/platform/live/liveBuild") === 0) return "comment";
+      return "";
+    },
+    // 本页是否具备「弹幕侧」能力（发评 / 关键词回复 / 读弹幕）
+    hasCommentSide: function () { return !this.isWxch() || this.page() === "comment"; },
+    // 本页是否具备「商品侧」能力（商品扫描 / 讲解）
+    hasGoodsSide: function () { return !this.isWxch() || this.page() === "goods"; },
+    // 发送按钮的**禁用态是否由框架异步驱动**（填完内容后要等一拍才可点）。
+    // buyin 同步；eos / fxg / wxch 实测都是异步 —— 填完立刻点会点在禁用按钮上 →
+    // 表现是"点了发送但评论没出来"，静默失败，极难排查。这几个站点必须走
+    // 「等一拍 → 重取按钮 → 仍禁用则退回 Enter」的流程。
+    // （新站点接入时请**显式回答**"它的禁用态是同步还是异步"，别默认套用。）
+    asyncSendState: function () {
+      var id = this.detect();
+      return id === "eos" || id === "fxg" || id === "wxch";
+    },
     supported: function () { return this.detect() !== "unknown"; },
     label: function () {
       var id = this.detect();
@@ -162,9 +196,14 @@
       return "未知站点";
     },
     // 面板标题用的站点简称（buyin 保持原来的"直播"，老站点观感不变）
+    // 拼出来的标题形如「🎯 <short>中控小助手」：
+    //   直播中控小助手 / 团购中控小助手 / 抖店中控小助手 / 视频号直播中控小助手
     short: function () {
       var id = this.detect();
-      return id === "eos" ? "团购" : (id === "fxg" ? "抖店" : "直播");
+      if (id === "eos") return "团购";
+      if (id === "fxg") return "抖店";
+      if (id === "wxch") return "视频号直播";
+      return "直播";
     },
   };
 
@@ -206,6 +245,10 @@
     // loose row selectors otherwise pick up nav items / settings rows, which was
     // the root cause of wrong product lists.
     scanProducts: function () {
+      // 页级能力守卫：视频号**弹幕页没有商品列表**（实测 0 处讲解/价格/库存）。
+      // 直接返回空，不让下面那套通用扫描在 antd 页面上瞎找 ——
+      // 通用策略第 3 步会在全页找"讲解"按钮，在这种页面上既浪费又可能误判工具栏。
+      if (!Site.hasGoodsSide()) return [];
       var now = Date.now();
       if (now - this._cache.lastScan < 1000) return this._cache.products;
       this._cache.lastScan = now;
@@ -224,7 +267,7 @@
         var btn = this._findExplainBtnInRow(row);
         if (!btn) continue; // not a product row → skip
 
-        var key = row.getAttribute("data-product-id") || row.getAttribute("data-id") || row.getAttribute("data-rbd-draggable-id") || "";
+        var key = this._rowKey(row);
         var name = extractProductName(row);
         if (!key) key = name || ("row_" + r);
         if (key && seen[key]) continue;
@@ -233,8 +276,11 @@
         products.push({
           id: key,
           name: name,
-          price: "",
-          stock: "",
+          // 视频号商品行的价格/库存：价格在 .price-wrap .price（«¥9.9»）；
+          // 库存在 .source，但每行有**两个** .source（«库存2904» / «浏览5»）→ 必须按「库存」前缀挑。
+          // 其余站点的行里没有这套 class，返回空串 → 行为不变（抖音侧 UI 本来也不读这俩字段）。
+          price: Site.isWxch() ? extractWxPrice(row) : "",
+          stock: Site.isWxch() ? extractWxStock(row) : "",
           row: row,
           explainBtn: btn,
           scanIndex: scanIndex, // positional fallback for re-location
@@ -277,7 +323,7 @@
           if (row3.offsetParent === null && row3.getClientRects().length === 0) continue; // hidden panel
           if (seenRows[row3._dy_id]) continue;
           seenRows[row3._dy_id || (row3._dy_id = "row_" + Math.random().toString(36).slice(2))] = true;
-          var key3 = row3.getAttribute("data-product-id") || row3.getAttribute("data-id") || row3.getAttribute("data-rbd-draggable-id") || "";
+          var key3 = this._rowKey(row3);
           var name3 = extractProductName(row3);
           if (!key3) key3 = name3 || ("row_" + b);
           if (key3 && seen[key3]) continue;
@@ -308,7 +354,7 @@
       //    凡是"以数字打头就否决"的规则，都会误杀「年份/规格/数字型号」打头的真实商品名。
       //
       // strict=true：额外把「数字打头」也当可疑。**只给第 3 步的整行文本兜底用** ——
-      //   那里拿到的是 "10:26:4826年黑米…" 这种整行拼接串，数字打头确实是垃圾特征。
+      //   那里拿到的是 "10:26:48<商品名>…" 这种整行拼接串，数字打头确实是垃圾特征。
       function isLikelyMetrics(text, strict) {
         var hits = ["到手价", "成交", "金额", "曝光", "转化", "销量", "观看", "订单",
           "佣金", "退款", "退货", "库存", "价格", "优惠", "利润", "人气", "点击",
@@ -321,6 +367,23 @@
         if (/^[¥￥]/.test(text)) return true;             // 货币符号打头 → 金额串
         if (strict && /^[\d¥￥]/.test(text)) return true; // 整行拼接串：数字打头即可疑
         return !/[\u4e00-\u9fa5]/.test(text);             // 一个汉字都没有 → 不可能是商品名
+      }
+
+      // 视频号商品行的价格（唯一 .price-wrap .price，文本形如 «¥9.9»）
+      function extractWxPrice(row) {
+        var el = row.querySelector(".price-wrap .price");
+        if (!el) return "";
+        var t = (el.textContent || "").trim();
+        return /[¥￥]/.test(t) ? t : "";
+      }
+      // 视频号商品行的库存：每行两个 .source（«库存…» / «浏览…»）→ 只认「库存」打头的那个
+      function extractWxStock(row) {
+        var els = row.querySelectorAll(".source");
+        for (var i = 0; i < els.length; i++) {
+          var t = (els[i].textContent || "").trim();
+          if (/^库存/.test(t)) return t.replace(/^库存\s*/, "");
+        }
+        return "";
       }
 
       // extract the product name from a row
@@ -407,7 +470,39 @@
     //   看着像虚拟滚动，但 2026-09-30 主人确认「商品只有 2 个」→ 撑高容器 432px
     //   就是实际行数（432 = 2×216），全量渲染成立，**无需 eos 那样的滚动渲染逻辑**。
     //   （若将来商品变多、发现扫不全，再照 _scanProductsEos 补滚动。）
+    // 行 → 商品号的**唯一**解析入口（原来策略 1 与策略 3 各写了一遍属性链，改了必漏一处）。
+    // 各站点的商品号落点不同：
+    //   buyin/fxg  data-rbd-draggable-id
+    //   wxch       **不在 data-* 上** —— 行内 span.id-wrap 的 id 属性 "id-<数字>" + 文本 "ID:<数字>"
+    _rowKey: function (row) {
+      if (!row || !row.getAttribute) return "";
+      return row.getAttribute("data-product-id") || row.getAttribute("data-id") ||
+             row.getAttribute("data-rbd-draggable-id") || this._wxProductId(row);
+    },
+    _wxProductId: function (row) {
+      if (!Site.isWxch() || !row || !row.querySelector) return "";
+      var el = row.querySelector("span.id-wrap") || row.querySelector("[id^='id-']");
+      if (!el) return "";
+      var m = (el.id || "").match(/^id-(\d+)$/);
+      if (m) return m[1];
+      m = (el.textContent || "").match(/ID[:：]\s*(\d+)/);
+      return m ? m[1] : "";
+    },
+
     _collectRows: function () {
+      // wxch（视频号商品页）：行是 div.table-row-wrap，有稳定 class。
+      // 只在商品页有商品行；弹幕页由 hasGoodsSide() 在上游守卫（scanProducts 直接返回空）
+      if (Site.isWxch()) {
+        var wxRows = document.querySelectorAll(".table-row-wrap");
+        var wxOut = [];
+        for (var wr = 0; wr < wxRows.length; wr++) {
+          // hover 才显示的 .hover-actions（删除/恢复原价）不可见 → 但这些在行内不影响行本身；
+          // 这里过滤的是"整行不可见"（面板收起/tab 切走）的情况
+          if (!Utils.isVisible(wxRows[wr])) continue;
+          wxOut.push(wxRows[wr]);
+        }
+        return wxOut;
+      }
       var rows = [];
       var exact = document.querySelectorAll(
         "[class*='goods-item'], [class*='goodsItem'], [class*='goods_item']"
@@ -447,6 +542,22 @@
       // eos（团购中控台）：讲解按钮是 div[class*='talking-btn']（不是 button，
       // 通用扫描抓不到），用专属选择器一步定位；取不到即说明该行不是商品行
       if (Site.isEos()) return this.eosExplainBtn(row);
+      // wxch（视频号商品页）：讲解按钮是 **span**，而且两种状态的**元素与文本都不同**：
+      //   未讲解 → span.promoting.multi-promoting      «讲解»
+      //   讲解中 → span.not-promoting                  «结束讲解»
+      //            （另有 div.content-color.recording-btn «00:45» 只是计时显示，点了会开别的弹窗）
+      // ⚠️ 通用文本扫描在这站两侧都失配：isExplainBtnText 只认 讲解/自动讲解/取消讲解，
+      //    认不出「结束讲解」；而讲解中的主元素文本是「00:45」，更不是讲解。
+      // ⚠️ 也不能用 [class*='promoting'] 子串匹配 —— promoting-wrap /
+      //    promoting-business-type-dropdown / promoting-dropdown-label（«购买模式»«送礼物模式»）
+      //    全都含这个子串。必须**精确 class**（classList）+ 可见性。
+      if (Site.isWxch()) {
+        var wxEnd = row.querySelector("span.not-promoting");
+        if (wxEnd && Utils.isVisible(wxEnd)) return wxEnd;
+        var wxStart = row.querySelector("span.promoting");
+        if (wxStart && Utils.isVisible(wxStart)) return wxStart;
+        return null;
+      }
       // 1. known component class first (most reliable)
       //    greyBtnStyle-* 是 2026-09-30 实测的 fxg（抖店中控台）灰色按钮特征 —— 驼峰、无连字符，
       //    原来那三个选择器（lvc2-grey-btn / grey-btn / GreyBtn）在 fxg 上一个都不命中，
@@ -627,7 +738,63 @@
 
     // 行是否仍在 DOM 且能取到讲解按钮
     _isRowLive: function (product) {
-      return !!(product && product.row && product.row.isConnected && this.eosExplainBtn(product.row));
+      if (!(product && product.row)) return false;
+      // wxch：行内**可见** span.not-promoting = 正在讲解。
+      // 判据用"结束讲解按钮存在"而不是"按钮文本"—— 讲解中时主元素文本是计时器 00:45，靠文本必失配。
+      // 表格被 Vue 整块重渲染时 row 会脱节点 → 先按商品号重新定位再判
+      if (Site.isWxch()) {
+        if (!product.row.isConnected) {
+          var r2 = this._wxFindRowById(product.id);
+          if (r2) product.row = r2;
+        }
+        if (!product.row.isConnected) return false;
+        var endBtn = product.row.querySelector("span.not-promoting");
+        return !!(endBtn && Utils.isVisible(endBtn));
+      }
+      return !!(product.row.isConnected && this.eosExplainBtn(product.row));
+    },
+
+    // wxch：按商品号重新定位行（表格重渲染后 row 会失效）
+    _wxFindRowById: function (id) {
+      if (!id) return null;
+      var rows = document.querySelectorAll(".table-row-wrap");
+      for (var i = 0; i < rows.length; i++) {
+        if (this._wxProductId(rows[i]) === String(id)) return rows[i];
+      }
+      return null;
+    },
+
+    // wxch：视频号的动作按钮点击后可能弹确认框（弹窗是 .weui-desktop-popper，默认 display:none）。
+    // 从静态 DOM 看不出点「讲解」到底弹不弹，所以两条路都走 —— 点完若没变成目标状态，
+    // 就找可见弹窗点它的「确定」，再校验一次。
+    _wxConfirmDialog: function () {
+      var pops = document.querySelectorAll(".weui-desktop-popper");
+      for (var i = 0; i < pops.length; i++) {
+        if (!Utils.isVisible(pops[i])) continue;
+        var btns = pops[i].querySelectorAll("button");
+        for (var j = 0; j < btns.length; j++) {
+          if ((btns[j].textContent || "").trim() === "确定") { Utils.clickEl(btns[j]); return true; }
+        }
+      }
+      return false;
+    },
+
+    // wxch：点 + **校验结果**（返回 Promise<boolean>，与 eos 同契约，调用侧统一 Promise.resolve 收口）
+    _wxClickAndVerify: function (product, wantLive) {
+      var self = this;
+      if (!product || !product.row) return Promise.resolve(false);
+      var btn = this._findExplainBtnInRow(product.row);
+      if (!btn) return Promise.resolve(false);
+      // 已经是目标状态 → 视为成功，不做反向动作（同 clickExplain/cancelExplain 的既有语义）
+      if (this._isRowLive(product) === wantLive) return Promise.resolve(true);
+      Utils.clickEl(btn);
+      return Utils.sleep(350).then(function () {
+        if (self._isRowLive(product) === wantLive) return true;
+        if (self._wxConfirmDialog()) {
+          return Utils.sleep(350).then(function () { return self._isRowLive(product) === wantLive; });
+        }
+        return false;
+      });
     },
 
     // eos：确保目标行已在 DOM 中（必要时滚动 + 等渲染），返回 Promise<row>
@@ -652,6 +819,9 @@
     // Any text that still references 讲解 identifies it as an explain button;
     // an already-explaining state is treated as success so we never toggle OFF.
     clickExplain: function (product) {
+      // wxch（视频号商品页）：点 span.promoting 开始讲解，**点完校验结果**
+      // （点「讲解」是否弹确认框从静态 DOM 看不出来 → 见 _wxConfirmDialog 的两条路）
+      if (Site.isWxch()) return this._wxClickAndVerify(product, true);
       // eos（虚拟列表）：目标行未渲染时先滚动渲染、等一帧再点击 → 返回 Promise<boolean>
       if (Site.isEos() && product && typeof product.eosIndex === "number" && !this._isRowLive(product)) {
         var self = this;
@@ -688,6 +858,8 @@
     // Click "取消讲解" — used by single-product mode to pause explaining.
     // No-op success when the product is not currently explaining.
     cancelExplain: function (product) {
+      // wxch：结束讲解 = 点 span.not-promoting，点完校验
+      if (Site.isWxch()) return this._wxClickAndVerify(product, false);
       // eos（虚拟列表）：同上，先确保目标行已渲染 → 返回 Promise<boolean>
       if (Site.isEos() && product && typeof product.eosIndex === "number" && !this._isRowLive(product)) {
         var self2 = this;
@@ -757,8 +929,8 @@
       var idx = product && product.scanIndex;
       if (id) {
         for (var a = 0; a < rows.length; a++) {
-          var rid = rows[a].getAttribute("data-product-id") || rows[a].getAttribute("data-id") || rows[a].getAttribute("data-rbd-draggable-id") || "";
-          if (rid && rid === id) return rows[a];
+          // 用统一的 _rowKey（原来自写属性链 → wxch 的商品号不在 data-* 上，会漏）
+          if (this._rowKey(rows[a]) === String(id)) return rows[a];
         }
       }
       if (name) {
@@ -833,6 +1005,16 @@
         if (!eosInput) log.warn("未找到评论输入框（评论区面板是否收起？）");
         return eosInput || null;
       }
+      // wxch（视频号·弹幕页）：输入框有稳定 class `message-input`，且该页只有一个 textarea。
+      // 与 eos 同理**刻意不回退到通用选择器** —— 视频号后台是 antd 页面，还有商品搜索框
+      // 等同类控件，通用 [class*='input'] 系列一旦先命中就会打错地方（静默失效，比找不到更糟）。
+      if (Site.isWxch()) {
+        if (Site.page() !== "comment") return null;     // 商品页没有评论输入区
+        var wxInput = document.querySelector("textarea.message-input");
+        if (wxInput && Utils.isVisible(wxInput)) return wxInput;
+        log.warn("未找到评论输入框（视频号弹幕页的「主播发言」框）");
+        return null;
+      }
       // Strategy 0（buyin / fxg 共用）：中控台评论输入区有稳定 id `input-comment-block-id`，
       // 用它锚定最可靠。为什么不用通用的 `textarea[class*='input']`？—— 2026-09-30 用 fxg 真实
       // DOM 实测：页面上还有别的同类输入框（商品搜索），一旦它排在评论输入框**之前**就会被先
@@ -899,6 +1081,20 @@
           var eosBtn = eosScope.querySelector("[class*='button-']");
           if (eosBtn && (eosBtn.textContent || "").trim().indexOf("发送") !== -1) return eosBtn;
           eosScope = eosScope.parentElement;
+        }
+      }
+
+      // Strategy 0（wxch 视频号·弹幕页）：发送按钮 = 评论输入区内的 weui 主按钮（文本「发送」）。
+      // 从**已定位到的输入框**往上找一个 scope 再取按钮，避免命中页面里其它 weui 主按钮
+      // （例如「添加商品」「确定」这类同为 weui-desktop-btn_primary 的按钮）。
+      if (Site.isWxch()) {
+        var wxIn = input || this.findCommentInput();
+        var wxScope = (wxIn && wxIn.closest) ? wxIn.closest(".live-message-input-container") : null;
+        if (wxScope) {
+          var wxBtns = wxScope.querySelectorAll("button");
+          for (var wi = 0; wi < wxBtns.length; wi++) {
+            if ((wxBtns[wi].textContent || "").trim() === "发送") return wxBtns[wi];
+          }
         }
       }
 
@@ -1001,12 +1197,12 @@
       // 记录本次发送文本，供弹幕监听识别"自己发的弹幕"（60s 窗口内忽略）
       this._rememberSent(text);
 
-      // eos（团购中控台）+ fxg（抖店中控台）专有发送流程：发送按钮是 div（不是 button），
-      // 空输入时带禁用态 class（eos: button-disable-* / fxg: isDisabled-*），
-      // 而 Vue 的禁用态在 nextTick 后才更新 → 填完立刻点可能点在禁用按钮上。
-      // 因此等一拍再点；若按钮仍禁用则退回 Enter（两个站的 placeholder 都写明「Enter键发送」）。
+      // 禁用态异步驱动的站点（eos 团购 / fxg 抖店 / wxch 视频号）专有发送流程：
+      // 空输入时按钮带禁用态 class（eos: button-disable-* / fxg: isDisabled-* /
+      // wxch: weui-desktop-btn_disabled），而框架的禁用态在 nextTick 后才更新 →
+      // 填完立刻点可能点在禁用按钮上。故等一拍再取一次按钮；仍禁用则退回 Enter。
       // 最后由"输入框是否被清空"判断是否真的发出（只在没发出时才补动作，避免重复发送）。
-      if (Site.isEos() || Site.isFxg()) {
+      if (Site.asyncSendState()) {
         var selfSend = this;
         Utils.sleep(150).then(function () {
           var btnNow = selfSend.findSendButton(input);
@@ -1150,6 +1346,30 @@
           return eosListEl;
         }
       }
+      // wxch（视频号·弹幕页）：容器有稳定 class，直接取，比结构打分可靠
+      //   div.live-message-scroller-container            ← 滚动视口
+      //   └── div.vue-recycle-scroller.comment__list      ← 虚拟滚动器（节点池在这一层）
+      // ⚠️ 必须返回**虚拟滚动器本身**：item-view 是由它管理的节点池，
+      //    只观察外层视口拿不到 item 级变更 → 表现为"一条弹幕也读不到"。
+      // ⚠️ 定位失败**不回退到通用打分**：这是 antd 页面，通用打分很容易把
+      //    侧边栏/工具列表误判成弹幕列表（比"找不到"更糟）。返回 null，由调用方打日志留痕。
+      if (Site.isWxch()) {
+        var wxList = document.querySelector(".live-message-scroller-container .comment__list") ||
+                     document.querySelector(".vue-recycle-scroller.comment__list") ||
+                     document.querySelector(".live-message-scroller-container");
+        if (wxList) {
+          // 评论标签页被切走时容器还在但不可见 → 脚本照跑却读不到弹幕，
+          // 提示一次（60s 节流），避免主人误以为"扩展坏了"
+          if (!Utils.isVisible(wxList) && now - (this._wxHiddenWarnAt || 0) > 60000) {
+            this._wxHiddenWarnAt = now;
+            log.warn("评论列表当前不可见（请切到「评论」标签页），弹幕监听暂不生效");
+          }
+          this._danmakuCache.container = wxList;
+          this._danmakuCache.checkedAt = now;
+          return wxList;
+        }
+        return null;
+      }
       var cached = this._danmakuCache.container;
       if (!force && cached && cached.isConnected && now - this._danmakuCache.checkedAt < 5000) {
         return cached;
@@ -1189,6 +1409,8 @@
       if (!node || node.nodeType !== 1) return null;
       // eos（团购中控台）评论区是另一套结构 → 走专属提取
       if (Site.isEos()) return this._extractDanmakuEos(node);
+      // wxch（视频号）也是另一套结构，且"系统消息没有昵称元素"这一点必须显式处理
+      if (Site.isWxch()) return this._extractDanmakuWx(node);
       var t = (node.textContent || "").trim();
       if (!t || t.length > 200) return null;
 
@@ -1247,6 +1469,47 @@
         content: content,
         core: this._extractCore(content),
         isSelf: nickInfo.isSelf,
+      };
+    },
+
+    // ---- wxch（视频号·弹幕页）消息行提取 ----
+    // 实测结构（2026-10-10 主人给的真实 DOM）：
+    //   div.live-message-item-container > div.live-message-item
+    //     ├── span.message-type             «主播»  ← **只有主播自己发言才有** → isSelf 判据
+    //     ├── span.finder-ui-live-*-badge    «买过4单» / «粉丝» / 等级徽章（不是昵称）
+    //     ├── span.message-username-desc     «娥:»   ← **昵称**（带尾部全角冒号）
+    //     └── span.message-content           «1号和2号有啥不同» ← 内容
+    // ⚠️ 本站最容易踩的坑：**系统消息只有 message-content、没有 message-username-desc**
+    //    （«琼赞了直播» / «ZFJ关注了主播» / «娥**  下单了1号商品»）。
+    //    若让它走通用兜底（昵称取全文），就会把"琼赞了直播"当成观众发言送去匹配关键词
+    //    → 给系统消息发回复。所以这里取不到昵称元素就**直接返回 null 跳过**。
+    _extractDanmakuWx: function (node) {
+      var item = (node.classList && node.classList.contains("live-message-item"))
+        ? node
+        : (node.querySelector ? node.querySelector(".live-message-item") : null);
+      if (!item) return null;
+      var contentEl = item.querySelector(".message-content");
+      if (!contentEl) return null;
+      var content = (contentEl.textContent || "").trim();
+      if (!content || content.length > 200) return null;
+      var nameEl = item.querySelector(".message-username-desc");
+      if (!nameEl) return null;                                  // 系统消息 / 进入提示 → 跳过
+      var nickname = (nameEl.textContent || "").trim()
+        .replace(/[：:\s]+$/, "")                                // 去尾部冒号（全角/半角）
+        .slice(0, 40);
+      if (!nickname) return null;
+      // isSelf：视频号用独立的 message-type 元素标明身份，比猜店名可靠得多
+      // （也避免把"本店名"这类业务信息写进代码）
+      var isSelf = false;
+      var typeEl = item.querySelector(".message-type");
+      if (typeEl && (typeEl.textContent || "").indexOf("主播") !== -1) isSelf = true;
+      if (!isSelf) isSelf = this._cleanNickname(nickname).isSelf;
+      return {
+        text: nickname + "：" + content,
+        nickname: nickname,
+        content: content,
+        core: this._extractCore(content),
+        isSelf: isSelf,
       };
     },
 
@@ -1330,6 +1593,9 @@
       if (!container) return null;
       // eos：评论区容器本身就是行级列表（子元素即评论行），不要往下钻
       if (Site.isEos()) return container;
+      // wxch：返回的是 vue-virtual-scroller 本身，它的子层是节点池 + item-wrapper，
+      // 往下钻只会钻到 item-wrapper（比 scroller 更"深"但监听面更窄）→ 原样返回
+      if (Site.isWxch()) return container;
       if (this._scoreDanmakuContainer(container) >= 10) return container;
       var best = null, bestScore = 0;
       for (var i = 0; i < container.children.length; i++) {
@@ -1713,9 +1979,13 @@
       this._matchedCount = 0;
       this._repliedCount = 0;
       this._failCount = 0;
+      // wxch（视频号）：虚拟滚动用节点池复用 DOM → 走"扫可见行 + 按 data-index 去重"策略。
+      // 启动时先把**当前已渲染的行**标记为已见，只回复"启动之后新来的"弹幕
+      // —— 与其它站点「只看新增节点」的语义对齐，否则一启动就会把历史弹幕全部回复一遍。
+      this._wxSeenIndex = {};
+      if (Site.isWxch()) this._seedWxSeen();
 
-      this._observer = new MutationObserver(this._onMutation.bind(this));
-      this._observer.observe(this._container, { childList: true, subtree: true });
+      this._startObserver();
       this._healthTimer = setInterval(this._healthCheck.bind(this), 10000);
       log.ok("弹幕回复已启动，监听中（命中关键词自动回复）");
       log.info("弹幕容器: <" + this._container.tagName.toLowerCase() + (PageAPI._cls(this._container) ? " class='" + PageAPI._cls(this._container).slice(0, 60) + "'" : "") + ">");
@@ -1746,8 +2016,59 @@
       return { running: this.running, matched: this._matchedCount, replied: this._repliedCount };
     },
 
+    // 统一观察入口：站点差异集中在这里，避免两处 observe 各写一份、改一处漏一处。
+    _startObserver: function () {
+      if (!this._container) return;
+      if (this._observer) this._observer.disconnect();
+      this._observer = new MutationObserver(this._onMutation.bind(this));
+      this._observer.observe(this._container, {
+        childList: true,
+        subtree: true,
+        // wxch（视频号）是 vue-virtual-scroller：节点池复用会让"新消息"表现为
+        // **既有节点文本被改写**（没有 addedNodes）→ 必须一并观察 characterData
+        characterData: Site.isWxch(),
+      });
+    },
+
+    // wxch 专用：启动时把当前已渲染的行标记为已见（只回复启动后的新弹幕）
+    _seedWxSeen: function () {
+      var listEl = this._container || PageAPI.findDanmakuContainer();
+      if (!listEl) return;
+      var rows = listEl.querySelectorAll("[data-index]");
+      for (var i = 0; i < rows.length; i++) {
+        var idx = rows[i].getAttribute("data-index");
+        if (idx !== null && idx !== "") this._wxSeenIndex[idx] = true;
+      }
+      log.info("已忽略启动前已渲染的弹幕（只回复启动后新来的）");
+    },
+
+    // wxch 专用：扫当前渲染出来的消息行 → 按 data-index 去重后逐条处理。
+    // 为什么不用 mutations 的 addedNodes：vue-virtual-scroller 复用节点池，
+    // 同一条 item-view 会被反复改写内容，新消息可能完全没有 addedNodes。
+    // data-index 是虚拟滚动器给每条消息的稳定序号（实测 6,7,8… 连续递增），
+    // 拿它当去重键比"文本指纹"可靠 —— 同一观众连发两条相同内容也能正确区分。
+    _scanWxRows: function () {
+      var listEl = this._container;
+      if (!listEl || !listEl.isConnected) listEl = PageAPI.findDanmakuContainer();
+      if (!listEl) return;
+      var rows = listEl.querySelectorAll("[data-index]");
+      for (var i = 0; i < rows.length; i++) {
+        var idx = rows[i].getAttribute("data-index");
+        if (idx === null || idx === "") continue;
+        if (this._wxSeenIndex[idx]) continue;
+        // ⚠️ 节点池是"先挂 data-index、后填内容"的：内容还没渲染出来时**不能**标记已见，
+        //    否则这条会被永久跳过（等下一次 mutation 再来处理）
+        if (!rows[i].querySelector(".live-message-item")) continue;
+        this._wxSeenIndex[idx] = true;
+        this._handleNode(rows[i]);
+      }
+    },
+
     _onMutation: function (mutations) {
       if (!this.running) return;
+      // wxch（视频号）：虚拟滚动复用节点池，新消息未必以 addedNodes 出现 →
+      // 这里只把 mutations 当"列表有变化了"的触发信号，不看内容，直接扫可见行去重。
+      if (Site.isWxch()) return this._scanWxRows();
       for (var m = 0; m < mutations.length; m++) {
         var added = mutations[m].addedNodes;
         if (!added || added.length === 0) continue;
@@ -1899,9 +2220,9 @@
         var c = PageAPI.findDanmakuContainer(true);
         if (c) {
           this._container = PageAPI._resolveListContainer(c) || c;
-          if (this._observer) this._observer.disconnect();
-          this._observer = new MutationObserver(this._onMutation.bind(this));
-          this._observer.observe(this._container, { childList: true, subtree: true });
+          // 容器换了 → 之前记的 data-index 已失义，重新播种（否则新容器的历史会全部被当新消息）
+          if (Site.isWxch()) { this._wxSeenIndex = {}; this._seedWxSeen(); }
+          this._startObserver();
           log.ok("弹幕容器已重新定位");
         } else {
           log.warn("暂未找到弹幕容器，10 秒后重试");
@@ -1952,7 +2273,9 @@
 
       // Scan products on open
       this.refreshProducts();
-      log.info("中控助手已加载 · 站点：" + Site.label());
+      // 视频号弹幕页：本页无商品 → 从商品页拉一次只读清单填进面板
+      if (Site.isWxch() && Site.page() === "comment") this.refreshWxGoods();
+      log.info("中控小助手已加载 · 站点：" + Site.label());
       log.info("页面: " + (Probe.getPageType() || "未知"));
       if (Probe.hasVue()) log.ok("检测到 Vue " + (Probe.getVue().version || "") + " 应用");
 
@@ -1966,19 +2289,41 @@
       var panel = document.createElement("div");
       panel.id = "dy-assistant-panel";
 
+      // 视频号把「弹幕」和「商品」拆成两个页面。第一轮跨页链路没通，所以弹幕页不渲染
+      // 「自动讲解」tab（铁律：点了没反应的按钮比没有更坏）。**现在跨页链路已通**，
+      // 弹幕页的「开始」会去驱动商品页的 AutoExplain（缺页时 background 自动后台打开）
+      // → tab 恢复显示。
+      var showExplain = true;
+
+      // 视频号弹幕页：**本页看不到任何商品**，序号框等于"盲输"。
+      // 跨页链路已通 → 在这里放一块**只读**商品清单（序号/名称/价格 + 标出讲解中），
+      // 数据由 Cross.call("list_products") 从商品页取回。既治盲输，也是"跨页真通了"的活证据。
+      var isWxComment = Site.isWxch() && Site.page() === "comment";
+      var wxGoodsBlock = isWxComment
+        ? ('<div class="dy-section-title" style="display:flex;align-items:center">' +
+             '<span style="flex:1">商品页商品列表</span>' +
+             '<a id="dy-wx-goods-refresh" style="cursor:pointer;color:#89b4fa;font-weight:normal">刷新</a>' +
+           '</div>' +
+           '<div id="dy-wx-goods-list" style="font-size:11px;line-height:1.6;color:#a6adc8;' +
+             'max-height:118px;overflow:auto;padding:2px 0">读取中…</div>')
+        : "";
+
       panel.innerHTML =
         '<div id="dy-panel-header">' +
-          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + Site.short() + '中控助手</span>' +
+          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + Site.short() + '中控小助手</span>' +
           '<span class="min-btn" id="dy-min-btn">_</span>' +
         '</div>' +
         '<div id="dy-panel-tabs">' +
-          '<div class="tab active" data-tab="explain">自动讲解</div>' +
-          '<div class="tab" data-tab="comment">自动发评</div>' +
+          (showExplain ? '<div class="tab active" data-tab="explain">自动讲解</div>' : "") +
+          '<div class="tab' + (showExplain ? "" : " active") + '" data-tab="comment">自动发评</div>' +
           '<div class="tab" data-tab="reply">弹幕回复</div>' +
         '</div>' +
         '<div id="dy-panel-body">' +
           // --- Tab 1: Auto Explain ---
-          '<div class="dy-tab-content active" data-content="explain">' +
+          // 视频号弹幕页：只去掉 active（css: .dy-tab-content 默认 display:none，
+          // .active 才 display:block）→ 不开这个 tab 就永远看不到。
+          // 元素本身保留：下面的输入框绑定逻辑要按 id 取，缺了会报错。
+          '<div class="dy-tab-content' + (showExplain ? " active" : "") + '" data-content="explain">' +
             '<div class="dy-section">' +
               '<div class="dy-row">' +
                 '<label>间隔(秒)</label>' +
@@ -1996,6 +2341,7 @@
                 '<button class="dy-btn primary small" id="dy-explain-start">▶ 开始</button>' +
                 '<button class="dy-btn small" id="dy-explain-stop">■ 停止</button>' +
               '</div>' +
+              wxGoodsBlock +
             '</div>' +
           '</div>' +
           // --- Tab 2: Auto Comment ---
@@ -2077,6 +2423,10 @@
           this.classList.add("active");
           var content = Panel._el.querySelector("[data-content='" + tabName + "']");
           if (content) content.classList.add("active");
+          // 视频号弹幕页切到「自动讲解」时顺带刷新商品清单（状态可能已变）
+          if (tabName === "explain" && Site.isWxch() && Site.page() === "comment") {
+            Panel.refreshWxGoods();
+          }
         });
       }
 
@@ -2122,17 +2472,68 @@
           randomDelay: parseFloat(self._val("dy-explain-random")) || 5,
           shuffle: self._chk("dy-explain-shuffle"),
         };
-        AutoExplain.setConfig(cfg);
         Config.set("explain_cfg", {
           interval: cfg.interval,
           randomDelay: cfg.randomDelay,
           shuffle: cfg.shuffle,
           indices: self._val("dy-explain-indices"),
         });
+        // 视频号弹幕页：本页**没有商品**，所以「开始」实际是去驱动**商品页**的 AutoExplain
+        // （跨页）。商品页没开时 background 会替他后台打开再转发（"自动打开并接管"）。
+        // 超时给 20s：冷启动商品页要加载 Vue 应用 + content script + 500ms 延时注入。
+        if (Site.isWxch() && Site.page() === "comment") {
+          var wxIndices = self._val("dy-explain-indices");
+          log.info("正在连接商品页…");
+          // ① 先拉一次商品清单填进面板的只读列表（弹幕页看不到商品，序号框等于"盲输"）。
+          //    清单 UI 就是 `refreshWxGoods` 渲染出来的那块。
+          Panel.refreshWxGoods();
+          Cross.call("list_products", {}, 5000).then(function (lp) {
+            if (lp && lp.success && lp.products && lp.products.length) {
+              log.info("商品页商品列表已载入面板（共 " + lp.count + " 个，见上方列表）");
+            } else {
+              log.info("商品页尚未打开，正在替你打开…");
+            }
+            // ② 再让商品页启动讲解（缺页时 background 后台打开并等就绪，最多约 20s）
+            return Cross.call("explain_start", {
+              indices: wxIndices,
+              interval: cfg.interval,
+              randomDelay: cfg.randomDelay,
+              shuffle: cfg.shuffle,
+            }, 20000);
+          }).then(function (r) {
+            if (r && r.success) {
+              log.ok("商品页已接管，自动讲解启动（共 " + r.count + " 个商品）");
+              Panel._remoteExplain = true;
+            } else {
+              log.err("启动失败：" + ((r && r.error) || "未知原因"));
+              Panel._remoteExplain = false;
+            }
+            Panel._syncRunState();
+            Panel.refreshWxGoods(); // 讲解状态可能已变 → 刷新「讲解中」标记
+          });
+          Panel._syncRunState();
+          return;
+        }
+        AutoExplain.setConfig(cfg);
         AutoExplain.start(self._val("dy-explain-indices"));
         Panel._syncRunState(); // start 可能提前失败返回 → 以真实 running 为准
       });
-      this._onClick("dy-explain-stop", function () { AutoExplain.stop(); });
+      this._onClick("dy-explain-stop", function () {
+        if (Site.isWxch() && Site.page() === "comment") {
+          Cross.call("explain_stop", {}, 8000).then(function (r) {
+            Panel._remoteExplain = false;
+            Panel._syncRunState();
+            log.info((r && r.success) ? "已请求商品页停止讲解" : "停止请求未送达（商品页可能已关闭）");
+          });
+          return;
+        }
+        AutoExplain.stop();
+      });
+
+      // 视频号弹幕页：只读商品清单的手动刷新
+      this._onClick("dy-wx-goods-refresh", function () {
+        Panel.refreshWxGoods();
+      });
 
       // ---- Auto Comment ----
       this._onClick("dy-comment-start", function () {
@@ -2257,6 +2658,54 @@
       PageAPI.forceScan();
     },
 
+    // 视频号弹幕页：从商品页取回只读商品清单，渲染进 #dy-wx-goods-list。
+    // 商品页没开/未就绪时给一句明确提示，**不假装有数据**。
+    refreshWxGoods: function () {
+      var box = document.getElementById("dy-wx-goods-list");
+      if (!box) return;
+      box.textContent = "读取中…";
+      Cross.call("list_products", {}, 6000).then(function (r) {
+        var el = document.getElementById("dy-wx-goods-list");
+        if (!el) return;
+        // 用 textContent 拼装（商品名来自页面，走 innerHTML 要转义；直接建节点最省心）
+        var frag = document.createDocumentFragment();
+        if (!r || !r.success || !r.products || !r.products.length) {
+          var tip = document.createElement("span");
+          tip.style.color = "#f9e2af";
+          tip.textContent = "商品页未打开或尚未就绪，点「开始」会自动打开";
+          frag.appendChild(tip);
+          el.textContent = "";
+          el.appendChild(frag);
+          return;
+        }
+        for (var i = 0; i < r.products.length; i++) {
+          var p = r.products[i];
+          var rowEl = document.createElement("div");
+          rowEl.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+          var idx = document.createElement("span");
+          idx.style.color = "#6c7086";
+          idx.textContent = (p.index + 1) + ". ";
+          rowEl.appendChild(idx);
+          rowEl.appendChild(document.createTextNode(p.name || "未命名"));
+          if (p.price) {
+            var pr = document.createElement("span");
+            pr.style.color = "#a6e3a1";
+            pr.textContent = " " + p.price;
+            rowEl.appendChild(pr);
+          }
+          if (p.live) {
+            var lv = document.createElement("span");
+            lv.style.color = "#f38ba8";
+            lv.textContent = "  ← 讲解中";
+            rowEl.appendChild(lv);
+          }
+          frag.appendChild(rowEl);
+        }
+        el.textContent = "";
+        el.appendChild(frag);
+      });
+    },
+
     _val: function (id) {
       var el = document.getElementById(id);
       return el ? el.value : "";
@@ -2312,8 +2761,14 @@
     _syncRunState: function () {
       // 注意：AutoExplain 等是本 IIFE 内的 var 声明，**不会**挂到 window 上，
       // 必须直接引用标识符（写成 window.AutoExplain 会恒为 undefined → 状态永远同步不上）
+      // 视频号弹幕页：讲解跑在**商品页**，本地 AutoExplain.running 恒为 false →
+      // 直接读它会让按钮永远显示"未运行"，而实际商品页在讲（UI 撒谎）。
+      // 改用跨页轮询回来的远程状态（见 startRemoteExplainPoll）。
+      var remoteExplainPage = Site.isWxch() && Site.page() === "comment";
       var states = {
-        explain: !!(typeof AutoExplain !== "undefined" && AutoExplain.running),
+        explain: remoteExplainPage
+          ? !!Panel._remoteExplain
+          : !!(typeof AutoExplain !== "undefined" && AutoExplain.running),
         comment: !!(typeof AutoComment !== "undefined" && AutoComment.running),
         reply: !!(typeof AutoReply !== "undefined" && AutoReply.running),
       };
@@ -2354,6 +2809,41 @@
   //  其他标签页通过 chrome.runtime.sendMessage → background → content.js
   //  → window.postMessage 到这里，执行后原路返回结果
   // ========================================================================
+  // ========================================================================
+  //  CROSS-PAGE CALL – 中控页 → background → 另一个中控页（视频号两页专用）
+  //  ⚠️ inject.js 跑在**页面上下文**，拿不到 chrome.* API → 必须经 content.js 的
+  //     zkb-outbound 出站通道转发（见 js/content.js 末尾）。原来只有「外部页 → 中控页」
+  //     的入站方向，中控页自己发不出去，视频号弹幕页要驱动商品页就得补这一条。
+  //  返回 Promise<{success,...}>，**永不 reject**（调用方不必写 catch）。
+  // ========================================================================
+  var Cross = {
+    _seq: 0,
+    call: function (action, params, timeoutMs) {
+      var id = "zkbo_" + Date.now() + "_" + (++this._seq);
+      return new Promise(function (resolve) {
+        var done = false;
+        var timer = setTimeout(function () {
+          if (done) return;
+          done = true;
+          window.removeEventListener("message", onResp);
+          // 超时最常见的原因是"目标页没开" —— 直接把它写进错误里，省得主人对着一句
+          // "timeout" 猜半天
+          resolve({ success: false, error: "跨页调用超时（目标页面可能没打开）" });
+        }, timeoutMs || 10000);
+        function onResp(e) {
+          if (!e.data || e.data.source !== "zkb-outbound-response" || e.data.id !== id) return;
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          window.removeEventListener("message", onResp);
+          resolve(e.data.result || { success: false, error: "跨页返回为空" });
+        }
+        window.addEventListener("message", onResp);
+        window.postMessage({ source: "zkb-outbound", id: id, action: action, params: params || {} }, "*");
+      });
+    },
+  };
+
   window.addEventListener("message", function (e) {
     if (!e.data || e.data.source !== "zkb-bridge") return;
 
@@ -2386,9 +2876,22 @@
           }
           break;
 
-        // 获取商品列表
+        // 获取商品列表（含 live：本行是否正在讲解 → 供弹幕页显示"当前讲解"）
         case "list_products":
           result = _listProducts();
+          break;
+
+        // ---- 跨页：视频号弹幕页远程驱动本页（商品页）的自动讲解 ----
+        // 让**商品页本地跑** AutoExplain，而不是弹幕页逐条下发指令：
+        // 序号过滤 / 打乱 / 单商品交替 / 失败重试全在 AutoExplain 里，本地跑才复用得上；
+        // 弹幕页只负责"设参数 + 开/关 + 读状态"。
+        case "explain_start":
+          result = _explainStart(params);
+          break;
+
+        case "explain_stop":
+          AutoExplain.stop();
+          result = { success: true, running: false };
           break;
 
         // 获取运行状态
@@ -2463,9 +2966,35 @@
         name: products[i].name,
         price: products[i].price,
         stock: products[i].stock,
+        // 跨页展示要标出"正在讲解的是哪个"。视频号判据 = 行内可见 span.not-promoting
+        // （不能靠按钮文本：讲解中时那个元素显示的是计时器 00:45）
+        live: PageAPI._isRowLive(products[i]),
       });
     }
     return { success: true, count: list.length, products: list };
+  }
+
+  // 跨页启动自动讲解。params 经 postMessage 过来，只接受原始类型（不能传对象引用/函数）。
+  // config 用白名单逐项赋值，不让调用方塞进奇怪东西。
+  function _explainStart(params) {
+    if (!Site.hasGoodsSide()) {
+      return { success: false, error: "本页没有商品列表（视频号请把指令发到商品页）" };
+    }
+    if (typeof params.interval === "number" && params.interval > 0) {
+      AutoExplain.config.interval = params.interval;
+    }
+    if (typeof params.randomDelay === "number" && params.randomDelay >= 0) {
+      AutoExplain.config.randomDelay = params.randomDelay;
+    }
+    AutoExplain.config.shuffle = !!params.shuffle;
+    AutoExplain.start(typeof params.indices === "string" ? params.indices : "");
+    return {
+      success: !!AutoExplain.running,
+      running: !!AutoExplain.running,
+      count: (AutoExplain._order || []).length,
+      // 启动失败的原因在目标页日志里，这里补一句给调用方，免得只看到 success:false
+      error: AutoExplain.running ? undefined : "目标页未能启动（看商品页日志：可能无商品或序号无效）",
+    };
   }
 
   // ========================================================================
@@ -2487,8 +3016,34 @@
       return;
     }
 
-    // 3. Init panel
+    // 3. 视频号商品页：**本轮不建面板**（面板只在弹幕页，跨页控制还没做）。
+    //    但 inject.js 仍要加载并注册消息监听 —— 下一轮弹幕页要通过
+    //    background → content.js → window.postMessage 把「讲解」指令打到本页执行。
+    //    这里只屏蔽 UI，不屏蔽能力。
+    if (Site.isWxch() && Site.page() === "goods") {
+      console.log("[中控助手] 视频号商品页：面板在弹幕页，本页待命等待跨页指令");
+      return;
+    }
+
+    // 4. Init panel
     Panel.init();
+
+    // 视频号弹幕页：讲解跑在**商品页**，本页读不到它的 running →
+    // 定期问一次商品页状态来同步「开始」按钮高亮。
+    // 不轮询的话，商品页自己停了（连续失败/容器消失）这边按钮还亮着 = UI 撒谎。
+    if (Site.isWxch() && Site.page() === "comment") {
+      setInterval(function () {
+        // side:"goods" 是**显式提示**：get_status 这个名字看不出属于哪一侧，
+        // 靠它让 background 把这条路由到商品页（否则会被路由回弹幕页自己 → 永远 false）
+        Cross.call("get_status", { side: "goods" }, 4000).then(function (r) {
+          var on = !!(r && r.success && r.autoExplainRunning);
+          if (on !== Panel._remoteExplain) {
+            Panel._remoteExplain = on;
+            Panel._syncRunState();
+          }
+        });
+      }, 5000);
+    }
   }
 
   // Check that we're on a supported page (live control / group-buy live control)

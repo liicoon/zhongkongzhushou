@@ -15,7 +15,7 @@
  * 3. 不引入此文件，直接用原生 API（扩展注入的）：
  *    await window.__ZKB__.explain(0)
  *
- * 前提：Chrome 已安装"抖音直播中控助手"扩展，且中控台页面已打开。
+ * 前提：Chrome 已安装"直播中控小助手"扩展，且中控台页面已打开。
  */
 
 (function (global) {

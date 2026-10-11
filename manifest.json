@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "抖音直播中控助手",
-  "description": "直接操作抖音直播/团购中控台，实现自动讲解、自动发评、弹幕关键词自动回复",
-  "version": "2.5.0",
+  "name": "直播中控小助手",
+  "description": "支持抖音直播 / 抖音团购 / 抖店 / 视频号四个中控台，实现自动讲解、自动发评、弹幕关键词自动回复",
+  "version": "2.6.0",
   "action": {
-    "default_title": "抖音直播中控助手",
+    "default_title": "直播中控小助手",
     "default_icon": "assets/icon/logo.png",
     "default_popup": "popup.html"
   },
@@ -12,7 +12,8 @@
   "host_permissions": [
     "https://buyin.jinritemai.com/*",
     "https://eos.douyin.com/*",
-    "https://fxg.jinritemai.com/*"
+    "https://fxg.jinritemai.com/*",
+    "https://channels.weixin.qq.com/*"
   ],
   "background": {
     "service_worker": "js/background.js"
@@ -27,7 +28,9 @@
       "matches": [
         "https://buyin.jinritemai.com/dashboard/live/control*",
         "https://eos.douyin.com/livesite/live/current*",
-        "https://fxg.jinritemai.com/ffa/content-tool/live/control*"
+        "https://fxg.jinritemai.com/ffa/content-tool/live/control*",
+        "https://channels.weixin.qq.com/platform/live/liveBuild*",
+        "https://channels.weixin.qq.com/platform/live/commodity/onsale/index*"
       ],
       "js": ["js/content.js"],
       "run_at": "document_end"
@@ -44,7 +47,8 @@
       "matches": [
         "https://buyin.jinritemai.com/*",
         "https://eos.douyin.com/*",
-        "https://fxg.jinritemai.com/*"
+        "https://fxg.jinritemai.com/*",
+        "https://channels.weixin.qq.com/*"
       ]
     },
     {

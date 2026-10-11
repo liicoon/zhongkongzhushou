@@ -8,12 +8,16 @@
   //   buyin.jinritemai.com/dashboard/live/control      抖音直播中控台
   //   eos.douyin.com/livesite/live/current             抖音团购中控台
   //   fxg.jinritemai.com/ffa/content-tool/live/control 抖店直播中控台
+  //   channels.weixin.qq.com/platform/live/liveBuild            视频号·弹幕页
+  //   channels.weixin.qq.com/platform/live/commodity/onsale/index 视频号·商品页
   var _zkbHost = window.location.host;
   var _zkbPath = window.location.pathname || "";
   if (
     (_zkbHost === "buyin.jinritemai.com" && _zkbPath.indexOf("/dashboard/live/control") === 0) ||
     (_zkbHost === "eos.douyin.com" && _zkbPath.indexOf("/livesite/live/current") === 0) ||
-    (_zkbHost === "fxg.jinritemai.com" && _zkbPath.indexOf("/ffa/content-tool/live/control") === 0)
+    (_zkbHost === "fxg.jinritemai.com" && _zkbPath.indexOf("/ffa/content-tool/live/control") === 0) ||
+    (_zkbHost === "channels.weixin.qq.com" && _zkbPath.indexOf("/platform/live/liveBuild") === 0) ||
+    (_zkbHost === "channels.weixin.qq.com" && _zkbPath.indexOf("/platform/live/commodity/onsale/index") === 0)
   ) {
     return;
   }

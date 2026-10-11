@@ -136,7 +136,8 @@
   scanVue();
 
   // ====================== 4. Detect page type ======================
-  // The extension runs on three Douyin/Doudian consoles.
+  // The extension runs on Douyin / Doudian / 视频号 consoles.
+  // 视频号是两个页面（弹幕 / 商品），pageType 分开标，便于日志排查。
   var _ptHost = window.location.host;
   var _ptPath = window.location.pathname || "";
   if (_ptHost === "eos.douyin.com" && _ptPath.indexOf("/livesite/live/current") === 0) {
@@ -145,6 +146,10 @@
     P.pageType = "buyin-control";
   } else if (_ptHost === "fxg.jinritemai.com" && _ptPath.indexOf("/ffa/content-tool/live/control") === 0) {
     P.pageType = "fxg-doudian-control";
+  } else if (_ptHost === "channels.weixin.qq.com" && _ptPath.indexOf("/platform/live/liveBuild") === 0) {
+    P.pageType = "wxch-comment";
+  } else if (_ptHost === "channels.weixin.qq.com" && _ptPath.indexOf("/platform/live/commodity/onsale/index") === 0) {
+    P.pageType = "wxch-goods";
   } else {
     P.pageType = "unknown";
   }
