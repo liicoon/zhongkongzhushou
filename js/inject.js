@@ -1952,7 +1952,7 @@
 
       // Scan products on open
       this.refreshProducts();
-      log.info("中控助手已加载 · 站点：" + Site.label());
+      log.info("中控小助手已加载 · 站点：" + Site.label());
       log.info("页面: " + (Probe.getPageType() || "未知"));
       if (Probe.hasVue()) log.ok("检测到 Vue " + (Probe.getVue().version || "") + " 应用");
 
@@ -1968,7 +1968,7 @@
 
       panel.innerHTML =
         '<div id="dy-panel-header">' +
-          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + Site.short() + '中控助手</span>' +
+          '<span class="title" title="当前站点：' + Site.label() + '">🎯 ' + Site.short() + '中控小助手</span>' +
           '<span class="min-btn" id="dy-min-btn">_</span>' +
         '</div>' +
         '<div id="dy-panel-tabs">' +
