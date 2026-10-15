@@ -1,6 +1,33 @@
 (function () {
   "use strict";
 
+  // ====================== chrome.* 报错的人话化 + 防刷屏 ======================
+  // 典型场景：扩展重新加载（开发时改一行就重载）后，**已打开的页面不会自动刷新** ——
+  // 页面上残留的旧 content script 仍在运行，而它持有的 chrome.* 已失效：
+  //   chrome.runtime.sendMessage → 同步抛 "Uncaught Error: Extension context invalidated."
+  // 危害不只是控制台飘红：**回调不会执行** → 不会回 zkb-outbound-response →
+  // 中控页只能干等到自己的超时（弹幕页 explain_start 是 45s）→ 表现为"点了没反应 /
+  // 启动失败"，极易被误判成功能坏了（2026-10-12 真机排障时就被这条干扰过）。
+  var _staleWarned = false;
+  function friendlyRuntimeErr(raw) {
+    var msg = String(raw || "");
+    if (/context invalidated/i.test(msg)) {
+      return "扩展已重新加载，本页面上的脚本已失效 —— 请刷新本页后重试（扩展更新后必须先刷新页面）";
+    }
+    if (/receiving end does not exist|could not establish connection/i.test(msg)) {
+      return "未能连上扩展后台（background 未就绪或已被回收）—— 请刷新本页后重试";
+    }
+    return msg || "未知错误";
+  }
+  function warnStaleOnce() {
+    if (_staleWarned) return;
+    _staleWarned = true;
+    console.warn(
+      "[中控助手] 扩展已重新加载，但本页仍在跑旧脚本（chrome.* 已失效）。" +
+        "请刷新本页面；在刷新前，面板里的所有操作都会失败。"
+    );
+  }
+
   // ====================== 注入脚本 ======================
   function injectScript(url) {
     var s = document.createElement("script");
@@ -88,16 +115,28 @@
     window.addEventListener("message", function (e) {
       if (!e.data || e.data.source !== "zkb-outbound") return;
       var outId = e.data.id;
-      chrome.runtime.sendMessage(
-        { action: e.data.action, params: e.data.params || {} },
-        function (resp) {
-          // 读一下 lastError，否则 Chrome 会在控制台报 "Unchecked runtime.lastError"
-          if (chrome.runtime.lastError) {
-            resp = { success: false, error: chrome.runtime.lastError.message };
+      // ⚠️ 必须 try/catch：扩展重载后本页残留的旧脚本会让 sendMessage **同步抛**
+      //    "Extension context invalidated."（见文件头的说明）。抛了就没人回包 →
+      //    中控页干等到超时。这里捕获后**立刻**回一个带明确指引的失败结果。
+      try {
+        chrome.runtime.sendMessage(
+          { action: e.data.action, params: e.data.params || {} },
+          function (resp) {
+            // 读一下 lastError，否则 Chrome 会在控制台报 "Unchecked runtime.lastError"
+            if (chrome.runtime.lastError) {
+              resp = { success: false, error: friendlyRuntimeErr(chrome.runtime.lastError.message) };
+            }
+            window.postMessage({ source: "zkb-outbound-response", id: outId, result: resp || null }, "*");
           }
-          window.postMessage({ source: "zkb-outbound-response", id: outId, result: resp || null }, "*");
-        }
-      );
+        );
+      } catch (ex) {
+        warnStaleOnce();
+        window.postMessage({
+          source: "zkb-outbound-response",
+          id: outId,
+          result: { success: false, error: friendlyRuntimeErr(ex && ex.message) },
+        }, "*");
+      }
     });
   }
 })();

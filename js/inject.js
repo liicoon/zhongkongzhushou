@@ -7,22 +7,52 @@
   var log = {
     _el: null,
     _buf: [],
+    // ---- 跨页日志回传（2026-10-13 主人实测提出）--------------------------------
+    // 视频号**商品页按设计不建面板**（见 bootstrap 第 3 步直接 return），而它是
+    // background 用 active:false **后台打开**的标签页 —— 它的讲解日志只打在自己控制台里，
+    // 主人根本不会切过去看，于是表现为「讲解明明在跑，却看不到任何讲解日志」。
+    // 修法：日志同时进一个环形缓冲，由**弹幕页**在它**本来就有**的 5s 轮询里顺带取增量
+    // （见 get_status / explain_start 的 logs 字段 + Panel._absorbGoodsLogs）。
+    // 刻意**不新开消息通道**（那要动 content.js / background.js 两处）——复用已验证的
+    // get_status 通道：天然限流、商品页不在时天然静默、无需关心"对端 tab 是哪个"。
+    _relay: [],
+    _relaySeq: 0,
+    _relayMax: 80,
+    // 页面级 epoch：商品页**刷新**后 _relaySeq 会从 0 重来，若弹幕页还拿着旧 seq 做
+    // "只取更新的"，就会永远取不到（seq 恒小于旧值）→ 日志再也不显示。
+    // 所以带回 epoch，变了就让调用方把游标归零。
+    _epoch: Date.now(),
     init: function (el) { this._el = el; this.flush(); },
     flush: function () {
       if (!this._el) return;
-      for (var i = 0; i < this._buf.length; i++) this._append(this._buf[i]);
+      // replay=true：这批条目在入缓冲时**已经打过控制台**了，这里只补进面板，不重复打印
+      for (var i = 0; i < this._buf.length; i++) this._append(this._buf[i], true);
       this._buf = [];
     },
-    _append: function (entry) {
-      if (!this._el) return void this._buf.push(entry);
-      var d = document.createElement("div");
-      d.className = "log-line " + entry.level;
+    // 面板既可能"还没建"（init 之前），也可能**永远不建** ——
+    // 视频号**商品页按设计不建面板**（面板只在弹幕页），那边只跑能力、不出 UI。
+    // ⚠️ 所以"没面板就不输出"是错的：商品页上 log.warn/ok/info 会**全部静默**，
+    //    跨页排障时表现为"商品页明明执行了，却一个字都看不到"
+    //    （2026-10-12 真机实测踩到：弹幕页报「目标页未能启动」，
+    //      商品页却没有任何对应日志 → 白查一轮，还误以为是链路没通）。
+    //    规则：**日志永远进控制台**，面板只是额外多的一路展示。
+    _append: function (entry, replay) {
       var now = new Date();
       var ts = ("0" + now.getHours()).slice(-2) + ":" + ("0" + now.getMinutes()).slice(-2);
+      if (!replay) {
+        console.log("[中控助手][" + ts + "]", entry.msg);
+        // 进环形缓冲（供跨页拉取）。⚠️ 只在**非 replay** 路径入队：flush() 重放的是
+        // 同一条日志，再入队就成了重复条目（面板显示两遍 / 弹幕页也捞到两遍）。
+        this._relaySeq++;
+        this._relay.push({ seq: this._relaySeq, level: entry.level, msg: entry.msg });
+        if (this._relay.length > this._relayMax) this._relay.shift();
+      }
+      if (!this._el) { this._buf.push(entry); return; }
+      var d = document.createElement("div");
+      d.className = "log-line " + entry.level;
       d.textContent = "[" + ts + "] " + entry.msg;
       this._el.appendChild(d);
       this._el.scrollTop = this._el.scrollHeight;
-      console.log("[中控助手][" + ts + "]", entry.msg);
     },
     info: function (m) { this._append({ level: "info", msg: m }); },
     ok: function (m) { this._append({ level: "success", msg: m }); },
@@ -53,8 +83,32 @@
       } else {
         el.textContent = value;
       }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("input", { bubbles: true }));
+      // ⚠️ composed:true + InputEvent 是 2026-10-12 视频号真机踩出来的（"填进去了框架不认"）：
+      //   ① 视频号是 wujie 微前端，输入框在子应用 shadow DOM 里；非 composed 的 input 事件
+      //      出不了 shadow 边界 —— 若组件把"输入已变化 / 能否发送"的判断挂在宿主上就静默失效。
+      //   ② InputEvent 带 inputType/data，部分组件据此区分"真实输入"与程序赋值。
+      //   两者都是纯增强：light DOM 站点（buyin / eos / fxg）行为不变。
+      Utils.dispatchInput(el, value);
+      Utils.dispatchInput(el, value);
+    },
+
+    // 派发 input 事件（框架识别"用户输入"的关键）。
+    // 带 composed:true 才能穿过 open shadowRoot（视频号弹幕页的输入框就在里面）；
+    // 再补 inputType 让它更接近真实键入。构造失败则逐级降级，不抛错。
+    dispatchInput: function (el, value) {
+      if (!el) return;
+      var ev = null;
+      try {
+        ev = new InputEvent("input", {
+          bubbles: true, composed: true, inputType: "insertText",
+          data: value == null ? "" : String(value),
+        });
+      } catch (_) { ev = null; }
+      if (!ev) {
+        try { ev = new Event("input", { bubbles: true, composed: true }); }
+        catch (_2) { ev = new Event("input", { bubbles: true }); }
+      }
+      try { el.dispatchEvent(ev); } catch (_3) {}
     },
 
     // click an element using multiple strategies
@@ -238,6 +292,9 @@
   // ========================================================================
   var PageAPI = {
     _cache: { products: [], lastScan: 0 },
+    // 视频号商品页：本轮扫描是否启用了"可见性兜底"（全部行都被判不可见 → 退回全部行）。
+    // 只用于诊断输出，不影响其它站点。
+    _wxVisFallback: false,
 
     // ---------- Product discovery ----------
     // Scan DOM for product rows; cache the result briefly.
@@ -428,6 +485,118 @@
       return this.scanProducts();
     },
 
+    // ---------- 穿透 shadow DOM 的查询（视频号专用） ----------
+    // 视频号是 **wujie(无界)微前端**：商品列表由名为 eccommerce 的子应用渲染，而 wujie
+    // 默认把子应用的 DOM 挂进 wujie-app 的 **shadowRoot**（做样式隔离）。
+    // → document.querySelectorAll 只看 light DOM，**穿不透 shadow 边界** →
+    //   "页面上明明有 4 个商品，扫描器却报 0 个"（2026-10-12 真机，连查两轮才定性）。
+    //   证据链：① 商品页诊断 rows=0；② 该页 console 出现 window.__WUJIE_MOUNT / startApp；
+    //   ③ 弹幕页（主应用，不是子应用）用 document 查得到 .live-message-scroller-container
+    //      —— 这正好解释"同一站点两个页面，一个正常、一个恒为 0"。
+    // 只给 wxch 用：其它三站点的列表都在 light DOM，一行业务逻辑都不动。
+    //
+    // 代价控制：找 shadow 宿主需要遍历全页所有元素，所以按 1s 缓存（等待期每 700ms 就强扫
+    // 一次）；light DOM 命中时**直接返回**，不进 shadow → 常态下零额外开销。
+    _deepRoots: null,
+    _deepRootsAt: 0,
+    _deepStat: null,
+
+    // 收集 document + 所有可达的 open shadowRoot（+ 同源 iframe 的 document）
+    _deepQueryRoots: function () {
+      var now = Date.now();
+      if (this._deepRoots && now - this._deepRootsAt < 1000) return this._deepRoots;
+      var roots = [document];
+      var queue = [document];
+      var nShadow = 0, nFrame = 0, guard = 0;
+      while (queue.length > 0 && guard < 150) {
+        var r = queue.shift();
+        var all;
+        try { all = r.querySelectorAll("*"); } catch (_) { continue; }
+        for (var i = 0; i < all.length; i++) {
+          var sr = all[i].shadowRoot;      // 只有 open 模式拿得到；wujie 默认 open
+          if (sr && roots.indexOf(sr) === -1) {
+            nShadow++; guard++;
+            roots.push(sr); queue.push(sr);
+            if (guard >= 150) break;
+          }
+        }
+        // 同源 iframe 顺带穿一层：这是"查不到"的另一类成因，命中就省一整轮排查
+        var frames;
+        try { frames = r.querySelectorAll("iframe"); } catch (_) { frames = []; }
+        for (var f = 0; f < frames.length; f++) {
+          var doc = null;
+          try { doc = frames[f].contentDocument; } catch (_) { doc = null; }
+          if (doc && roots.indexOf(doc) === -1) { nFrame++; roots.push(doc); queue.push(doc); }
+        }
+      }
+      this._deepRoots = roots;
+      this._deepRootsAt = now;
+      this._deepStat = { shadowRoots: nShadow, frames: nFrame };
+      return roots;
+    },
+
+    // 跨 document / shadowRoot 查选择器。light DOM 命中就直接返回（常态最快路径）。
+    // force=true：不短路，按 roots 顺序（document 在前）把 light + shadow + 同源 iframe
+    //   的结果**合并**返回，由调用方自己挑。用于"light DOM 里有隐藏副本/空壳会掩盖
+    //   shadow 里真实节点"的场景（低频调用）。高频的商品表扫描仍走默认短路模式，零额外开销。
+    deepAll: function (sel, force) {
+      var light = document.querySelectorAll(sel);
+      if (light.length > 0 && !force) return light;
+      if (!Site.isWxch()) return light;
+      var roots = this._deepQueryRoots();
+      var out = [];
+      for (var i = 0; i < roots.length; i++) {
+        if (!force && roots[i] === document) continue;   // 上面已查过
+        var els;
+        try { els = roots[i].querySelectorAll(sel); } catch (_) { continue; }
+        for (var j = 0; j < els.length; j++) out.push(els[j]);
+      }
+      return out;
+    },
+
+    // 视频号商品页：扫描诊断（跨页排障的唯一信息来源）
+    // 这一页**不建面板**，出错时调用方（弹幕页）只能看到一句结论 → 必须由本页把
+    // "到底卡在哪一步"说清楚。每个字段对应一种完全不同的病因：
+    //   rows=0                 → 商品表根本没渲染出来（还没加载完 / 这场没有 / 页面被换掉）
+    //   rowsLight=0 而 rows>0  → 商品表在 wujie 子应用的 **shadow DOM** 里（shadowRoots 会 >0）
+    //                            ← 2026-10-12 真机就是这个（页面上有 4 个商品，document 层恒 0）
+    //   rows>0 而 products=0   → 行在，但讲解按钮没认出来（结构变了）
+    //   rowsVisible=0          → 可见性判据失灵（后台标签页），visFallback 应已启用
+    //   tabHidden=true         → 本页在后台（不是错，只是解释上面那条）
+    wxScanDiag: function () {
+      if (!Site.isWxch()) return null;
+      // ⚠️ 必须 deepAll：商品表在 wujie 子应用的 shadow DOM 里 →
+      //    document 层恒为 0，而页面上明明有商品（真机踩过）
+      var rowsLightCount = document.querySelectorAll(".table-row-wrap").length;
+      this._deepQueryRoots();     // 刷新 shadow/iframe 统计（1s 缓存）
+      var rows = this.deepAll(".table-row-wrap");
+      var visRows = 0, withBtn = 0, visBtn = 0, ids = [];
+      for (var i = 0; i < rows.length; i++) {
+        if (Utils.isVisible(rows[i])) visRows++;
+        var b = rows[i].querySelector("span.not-promoting, span.promoting");
+        if (b) { withBtn++; if (Utils.isVisible(b)) visBtn++; }
+        var id = this._wxProductId(rows[i]);
+        if (id) ids.push(id);
+      }
+      return {
+        path: location.pathname,
+        rows: rows.length,
+        // rowsLight=0 而 rows>0 → 商品表在子应用的 shadow DOM 里（shadowRoots 会 >0）
+        rowsLight: rowsLightCount,
+        shadowRoots: (this._deepStat && this._deepStat.shadowRoots) || 0,
+        frames: (this._deepStat && this._deepStat.frames) || 0,
+        rowsVisible: visRows,
+        rowsWithBtn: withBtn,
+        btnVisible: visBtn,
+        ids: ids.length,
+        firstId: ids[0] || "",
+        cachedProducts: (this._cache.products || []).length,
+        visFallback: !!this._wxVisFallback,
+        tabHidden: !!document.hidden,
+        visibility: document.visibilityState,
+      };
+    },
+
     // Find candidate product row elements, scoped to product-ish containers.
     // Scoping avoids a full-page querySelectorAll on busy live pages.
     _collectContainers: function () {
@@ -493,15 +662,27 @@
       // wxch（视频号商品页）：行是 div.table-row-wrap，有稳定 class。
       // 只在商品页有商品行；弹幕页由 hasGoodsSide() 在上游守卫（scanProducts 直接返回空）
       if (Site.isWxch()) {
-        var wxRows = document.querySelectorAll(".table-row-wrap");
+        // deepAll（不是 document.querySelectorAll）：商品表在 wujie 子应用的 shadow DOM 里
+        var wxRows = this.deepAll(".table-row-wrap");
         var wxOut = [];
+        var wxHidden = [];
         for (var wr = 0; wr < wxRows.length; wr++) {
           // hover 才显示的 .hover-actions（删除/恢复原价）不可见 → 但这些在行内不影响行本身；
           // 这里过滤的是"整行不可见"（面板收起/tab 切走）的情况
-          if (!Utils.isVisible(wxRows[wr])) continue;
-          wxOut.push(wxRows[wr]);
+          if (Utils.isVisible(wxRows[wr])) wxOut.push(wxRows[wr]);
+          else wxHidden.push(wxRows[wr]);
         }
-        return wxOut;
+        // ⚠️ 失败兜底（2026-10-12 真机才敢加）：视频号商品页**常年待在后台标签页**
+        //    （面板在弹幕页，这一页只是被驱动）。未被绘制的标签页里 offsetParent /
+        //    getClientRects 都可能判成"不可见" → 严格过滤会把**整张表**判死 → 扫到 0 个
+        //    商品，而弹幕页那边只看到"扫到 0 个商品"，极易被误读成"这场没商品"。
+        //    判据：一行都没通过可见性、但**确实存在行** → 是可见性判据在这页失灵，
+        //    不是页面没商品。此时退回全部行（宁可多扫）。
+        //    为什么敢"宁可多扫"：本页 .table-row-wrap 只出现在"直播商品"表里
+        //    （2026-10-09 实测 DOM：5 行 = 5 个商品，无别的行）；真混进来了，
+        //    诊断字段 visFallback 会把它暴露出来。
+        this._wxVisFallback = wxOut.length === 0 && wxHidden.length > 0;
+        return this._wxVisFallback ? wxHidden : wxOut;
       }
       var rows = [];
       var exact = document.querySelectorAll(
@@ -553,10 +734,13 @@
       //    全都含这个子串。必须**精确 class**（classList）+ 可见性。
       if (Site.isWxch()) {
         var wxEnd = row.querySelector("span.not-promoting");
-        if (wxEnd && Utils.isVisible(wxEnd)) return wxEnd;
         var wxStart = row.querySelector("span.promoting");
+        if (wxEnd && Utils.isVisible(wxEnd)) return wxEnd;
         if (wxStart && Utils.isVisible(wxStart)) return wxStart;
-        return null;
+        // 同 _collectRows 的兜底：按钮**在**、只是被判不可见（后台标签页未绘制）→ 仍认它。
+        // "这一行是不是商品行"靠的是**按钮存在**这个结构事实，可见性只是加分项；
+        // 拿可见性当硬门禁，会在后台标签页上把功能整体废掉 —— 而"商品页在后台"正是本设计常态。
+        return wxEnd || wxStart || null;
       }
       // 1. known component class first (most reliable)
       //    greyBtnStyle-* 是 2026-09-30 实测的 fxg（抖店中控台）灰色按钮特征 —— 驼峰、无连字符，
@@ -757,7 +941,7 @@
     // wxch：按商品号重新定位行（表格重渲染后 row 会失效）
     _wxFindRowById: function (id) {
       if (!id) return null;
-      var rows = document.querySelectorAll(".table-row-wrap");
+      var rows = this.deepAll(".table-row-wrap");   // 同 _collectRows：要穿透 shadow
       for (var i = 0; i < rows.length; i++) {
         if (this._wxProductId(rows[i]) === String(id)) return rows[i];
       }
@@ -768,7 +952,8 @@
     // 从静态 DOM 看不出点「讲解」到底弹不弹，所以两条路都走 —— 点完若没变成目标状态，
     // 就找可见弹窗点它的「确定」，再校验一次。
     _wxConfirmDialog: function () {
-      var pops = document.querySelectorAll(".weui-desktop-popper");
+      // 确认弹窗也由子应用渲染 → 同样在 shadow 里
+      var pops = this.deepAll(".weui-desktop-popper");
       for (var i = 0; i < pops.length; i++) {
         if (!Utils.isVisible(pops[i])) continue;
         var btns = pops[i].querySelectorAll("button");
@@ -1010,9 +1195,21 @@
       // 等同类控件，通用 [class*='input'] 系列一旦先命中就会打错地方（静默失效，比找不到更糟）。
       if (Site.isWxch()) {
         if (Site.page() !== "comment") return null;     // 商品页没有评论输入区
-        var wxInput = document.querySelector("textarea.message-input");
-        if (wxInput && Utils.isVisible(wxInput)) return wxInput;
-        log.warn("未找到评论输入框（视频号弹幕页的「主播发言」框）");
+        // ⚠️ 必须 deepAll(..., true)：视频号是 **wujie 微前端**，弹幕页的评论输入区
+        //    同样在子应用的 shadow DOM 里 → document.querySelector 恒 null，
+        //    表现为"自动发评/自动回复全部发送失败"（2026-10-12 真机踩到：
+        //    商品页的 shadow 问题修好后，才发现弹幕页的输入框是同一个坑）。
+        //    force=true 是防「light DOM 里有隐藏副本」短路掉 shadow 里真正可见的那个。
+        var wxInputs = this.deepAll("textarea.message-input", true);
+        var wxAny = null;
+        for (var wxi = 0; wxi < wxInputs.length; wxi++) {
+          if (!wxAny) wxAny = wxInputs[wxi];
+          if (Utils.isVisible(wxInputs[wxi])) return wxInputs[wxi];
+        }
+        log.warn("未找到评论输入框（视频号弹幕页的「主播发言」框）：共命中 " +
+          wxInputs.length + " 个，shadowRoots=" +
+          ((this._deepStat && this._deepStat.shadowRoots) || 0) +
+          (wxAny ? "，但都不可见（可能没切到「评论」标签页）" : ""));
         return null;
       }
       // Strategy 0（buyin / fxg 共用）：中控台评论输入区有稳定 id `input-comment-block-id`，
@@ -1064,6 +1261,38 @@
       return null;
     },
 
+    // 从候选集合里挑「发送」按钮。两条硬规则：
+    //   ① 文本必须**严格等于**「发送」——视频号页面上还有「发送给…」这类按钮，模糊匹配会误点；
+    //   ② **取最内层** —— weui 的真实结构是 div.weui-desktop-btn_wrp > button.weui-desktop-btn，
+    //      外层 wrapper 的 textContent 同样是「发送」。若误取 wrapper，click 派发在 div 上
+    //      不会触达内部 button → 表现是"点了没反应"（且完全静默）。
+    //   同层时 `<button>` 优先于 `[role=button]`/`<a>`/`<div>`。
+    _pickSendBtnIn: function (els) {
+      var list = [];
+      for (var i = 0; i < els.length; i++) {
+        if ((els[i].textContent || "").trim() !== "发送") continue;
+        list.push(els[i]);
+      }
+      if (!list.length) return null;
+      var innermost = [];
+      for (var j = 0; j < list.length; j++) {
+        var isInner = true;
+        for (var k = 0; k < list.length; k++) {
+          if (k !== j && list[j].contains && list[j].contains(list[k])) { isInner = false; break; }
+        }
+        if (isInner) innermost.push(list[j]);
+      }
+      var pool = innermost.length ? innermost : list;
+      var rank = function (el) {
+        if (el.tagName === "BUTTON") return 0;
+        if (el.getAttribute && el.getAttribute("role") === "button") return 1;
+        return 2;
+      };
+      var best = pool[0];
+      for (var m = 1; m < pool.length; m++) if (rank(pool[m]) < rank(best)) best = pool[m];
+      return best;
+    },
+
     findSendButton: function (input) {
       var texts = ["发送", "Send", "发布", "提交", "➤", "发"];
 
@@ -1090,12 +1319,36 @@
       if (Site.isWxch()) {
         var wxIn = input || this.findCommentInput();
         var wxScope = (wxIn && wxIn.closest) ? wxIn.closest(".live-message-input-container") : null;
-        if (wxScope) {
-          var wxBtns = wxScope.querySelectorAll("button");
-          for (var wi = 0; wi < wxBtns.length; wi++) {
-            if ((wxBtns[wi].textContent || "").trim() === "发送") return wxBtns[wi];
-          }
+        if (!wxScope) {
+          // 输入框没拿到 / 结构变了：用 deep 兜底直接找输入区容器（它同样可能在 shadow 里）
+          var wxScopeCands = this.deepAll(".live-message-input-container", true);
+          wxScope = wxScopeCands.length > 0 ? wxScopeCands[0] : null;
         }
+        // scope 链：输入区容器 → 其父 → 其祖父 → 输入框所在 root（shadowRoot / document）。
+        // 真机（2026-10-12）暴露的坑：旧实现**只认 `button` 标签**且只在
+        // `.live-message-input-container` **一层**里找 → 若真实 DOM 的发送按钮渲染成
+        // `<a>` / `<div role=button>` / `[class*=weui-desktop-btn]`，或挂在容器外一层，
+        // 就直接返回 null → sendComment 悄悄退回 Enter → 而视频号**不支持 Enter 发送**
+        // → 输入框内容保留，表现为「已发送」后紧跟「评论可能未发出」，全程无任何日志。
+        var wxScopes = [];
+        for (var ws = wxScope; ws && wxScopes.length < 3; ws = ws.parentElement) wxScopes.push(ws);
+        var wxRoot = (wxIn && wxIn.getRootNode) ? wxIn.getRootNode() : null;
+        if (wxRoot) wxScopes.push(wxRoot);
+        // 标签放宽（文本仍**严格等于**「发送」，见 _pickSendBtnIn），避免误点其它 weui 主按钮
+        var wxCands = "button, a, [role='button'], [class*='weui-desktop-btn'], [class*='btn']";
+        for (var wi = 0; wi < wxScopes.length; wi++) {
+          var wxCur = wxScopes[wi];
+          if (!wxCur || !wxCur.querySelectorAll) continue;
+          // **永不在 document 层兜底**：输入框在 light DOM 时最后一层就是 document，
+          // 全页搜「发送」可能点中页面别处的同名按钮（"打错地方"比"找不到"更糟）。
+          // 只有当最后一层是 shadowRoot（子应用作用域）时才允许在该作用域内兜底。
+          if (wxCur === document) continue;
+          var wxHit = this._pickSendBtnIn(wxCur.querySelectorAll(wxCands));
+          if (wxHit) return wxHit;
+        }
+        // 刻意**不回退到通用启发式**：视频号页面有大量 weui 主按钮（添加商品/确定…），
+        // 通用路径很容易点到别处（"打错地方"比"找不到"更糟，且静默无声）。
+        return null;
       }
 
       // Strategy 0（buyin / fxg 共用）：与输入框同一个稳定 id 锚点内取 inputSuffix。
@@ -1181,6 +1434,10 @@
     },
 
     sendComment: function (text) {
+      // 视频号：发送**异步化** —— 必须先等页面就绪（见 _wxSendComment），故返回 Promise<boolean>。
+      // 调用侧一律走 sendCommentAsync 收口：把 Promise 当布尔用会**瞬间判定成"已发送"**
+      // （2026-10-13 真机就吃过这个：实际上一条都没发出去，面板却显示"已发送"）。
+      if (Site.isWxch()) return this._wxSendComment(text);
       var input = this.findCommentInput();
       if (!input) {
         log.warn("未找到聊天输入框");
@@ -1197,10 +1454,11 @@
       // 记录本次发送文本，供弹幕监听识别"自己发的弹幕"（60s 窗口内忽略）
       this._rememberSent(text);
 
-      // 禁用态异步驱动的站点（eos 团购 / fxg 抖店 / wxch 视频号）专有发送流程：
-      // 空输入时按钮带禁用态 class（eos: button-disable-* / fxg: isDisabled-* /
-      // wxch: weui-desktop-btn_disabled），而框架的禁用态在 nextTick 后才更新 →
-      // 填完立刻点可能点在禁用按钮上。故等一拍再取一次按钮；仍禁用则退回 Enter。
+      // 禁用态异步驱动的站点（eos 团购 / fxg 抖店）专有发送流程 —— 视频号已在函数开头
+      // 分流到 _wxSendComment，这里不再涉及它。行为与改动前**逐行等价**：
+      // 空输入时按钮带禁用态 class（eos: button-disable-* / fxg: isDisabled-*），
+      // 而框架的禁用态在 nextTick 后才更新 → 填完立刻点可能点在禁用按钮上。
+      // 故等一拍再取一次按钮；仍禁用则退回 Enter。
       // 最后由"输入框是否被清空"判断是否真的发出（只在没发出时才补动作，避免重复发送）。
       if (Site.asyncSendState()) {
         var selfSend = this;
@@ -1238,6 +1496,158 @@
       return true;
     },
 
+    // ================== 视频号：发送（异步，**先等就绪**） ==================
+    // 2026-10-13 真机（主人：「切换成别的 tab 之后」）暴露两个问题：
+    //   ① 页面隐藏时助手长连接会掉（同页控制台 `websocket已断开....正在尝试重连`），app 会把
+    //      「主播发言」框**置灰**、发送按钮长期 loading。旧实现照旧写值+点击（其实发不出去），
+    //      还抢先在 AutoComment 里打了「已发送」—— 面板在撒谎（主人核对：两条只到了一条）。
+    //   ② 更糟：它把内容**写进上一个请求仍挂着的那个输入框**，等上一条的回执回来清空输入框，
+    //      会把这一条一起抹掉 → 消息凭空消失。
+    // 判据（与铁律「判据要放在能看到全过程的那一层」同源）：**写值之前先等页面就绪**；
+    // 等不到就跳过本条、不计失败，恢复后继续 —— 既不发假日志，也不污染挂起的输入框。
+    _wxReadyWaitMs: 10000,   // 等就绪上限：够吸收"上一轮请求在途"，又不至于把发送队列卡死
+    _wxReadyStepMs: 250,
+    _lastSendSkip: "",       // 非空 = 上一次发送是"跳过"（调用侧据此**不计失败**）
+
+    // 等到"可以发送"的那一刻：输入框存在、未被置灰、发送按钮不在途。
+    // 常态（页面已就绪）第一次探测即返回 → **零额外延迟**，不影响正常节奏。
+    wxWaitSendReady: function (maxMs) {
+      var self = this;
+      var limit = maxMs || this._wxReadyWaitMs;
+      var waited = 0;
+      return new Promise(function (resolve) {
+        (function probe() {
+          var input = self.findCommentInput();
+          if (input && !input.disabled && !self._isSendBusy(self.findSendButton(input))) {
+            resolve(input); return;
+          }
+          waited += self._wxReadyStepMs;
+          if (waited >= limit) { resolve(null); return; }
+          setTimeout(probe, self._wxReadyStepMs);
+        })();
+      });
+    },
+
+    // 统一发送入口：视频号返回 Promise（先等就绪），其它站点返回同步布尔。
+    // 调用侧一律走这里，避免"把 Promise 当布尔用"（那会瞬间判定成"已发送"）。
+    sendCommentAsync: function (text, cb) {
+      var r = this.sendComment(text);
+      if (r && typeof r.then === "function") {
+        r.then(cb, function () { cb(false); });
+        return;
+      }
+      cb(r);
+    },
+
+    _wxSendComment: function (text) {
+      var selfSend = this;
+      this._lastSendSkip = "";
+      return this.wxWaitSendReady().then(function (input) {
+        if (!input) {
+          selfSend._lastSendSkip = "已等 " + Math.round(selfSend._wxReadyWaitMs / 1000) +
+            "s 输入框仍未就绪（被 app 置灰 / 发送按钮在途）";
+          log.warn("页面未就绪，本条**跳过**（不计失败，页面恢复后继续）：" + selfSend._lastSendSkip);
+          return false;
+        }
+        var maxLen = parseInt(input.getAttribute("maxlength"), 10);
+        if (!isNaN(maxLen) && maxLen > 0 && text.length > maxLen) {
+          log.warn("回复超过输入框上限 " + maxLen + " 字，已截断：" + text);
+          text = text.slice(0, maxLen);
+        }
+        Utils.triggerVueInput(input, text);
+        // 记录本次发送文本，供弹幕监听识别"自己发的弹幕"（60s 窗口内忽略）
+        selfSend._rememberSent(text);
+        return new Promise(function (resolve) {
+          var sendPath = "";
+          Utils.sleep(150).then(function () {
+            // 视频号组件要求输入框处于聚焦态才允许发送（程序赋值不改变焦点）
+            try { input.focus(); } catch (_) {}
+            var btnNow = selfSend.findSendButton(input);
+            // 按钮已是 loading（上一轮请求仍在途）→ 再点毫无意义，也**不能退回 Enter**
+            // （视频号不支持 Enter 发送，退回只会刷噪音日志）。
+            if (selfSend._isSendBusy(btnNow)) sendPath = "busy";
+            else if (btnNow && !selfSend._isSendDisabled(btnNow)) { sendPath = "click"; Utils.clickEl(btnNow); }
+            else { sendPath = "enter"; Utils.pressEnter(input); }
+            return Utils.sleep(600);
+          }).then(function () {
+            // 结算在后台继续跑（结果靠日志上报）；这里先回"已提交"，不堵住调用方。
+            selfSend._wxSettleSend(input, sendPath);
+            resolve(true);
+          });
+        });
+      });
+    },
+
+    // ---------- 视频号：发送之后的「结果结算」 ----------
+    // 为什么必须"等状态收敛"、不能"点完采样一次就判"？（2026-10-13 真机踩到，且是**误报**）
+    //   真机在点击后约 750ms 采样到：btnLoading=true + inDisabled=true ——
+    //   这本来正是"扩展的点击已生效"的铁证（app 收到并进入发送中），旧实现却照样吐出两条以
+    //   「可能未发出」结尾的 WARN；主人实测**该弹幕发布成功**。
+    //   根因 = 采样窗口太短：app 的发送是异步的，回执要几秒。一次采样覆盖不了瞬态 ——
+    //   与项目铁律「判据要放在能看到全过程的那一层，别拿一次采样下结论」同源。
+    //   （M14 那次是**测试探针**窗口太短，这次是**产品代码**窗口太短：同一个坑的两副面孔。）
+    // 判据：
+    //   ① 输入框被清空                             → 送达（唯一正向证据）
+    //   ② 状态收敛（不再 loading / 不再禁用）而内容还在 → 真的没发出去（此时才允许补点一次）
+    //   ③ 到期仍在途                              → **结论未知**：只说"未等到回执"，
+    //                                               绝不报成"没发出"（真机上这种多半已发出）
+    // 注：「写值前就未就绪」这一种已由 _wxSendComment 的**等就绪**在上游处理掉了，
+    //     这里不再需要 preDisabled 那套一票否决（该分支 2026-10-13 被真机证伪，已删除）。
+    _wxSettleTick: 400,   // 轮询步长（ms）
+    _wxSettleMax: 25,     // 轮询次数 → 约 10s：必须长于真机回执时长
+    _wxSettleSend: function (input, sendPath) {
+      var selfSend = this;
+      var tick = this._wxSettleTick || 400;
+      var max = this._wxSettleMax || 25;
+      var ticks = 0;
+      var retried = false;
+      return new Promise(function (resolve) {
+        (function poll() {
+          ticks++;
+          var el = selfSend.findCommentInput() || input;
+          if (el && !String(el.value || "").trim()) {
+            log.ok("评论已送达（输入框已清空）");
+            resolve(true); return;
+          }
+          var btn = selfSend.findSendButton(el);
+          var busy = selfSend._isSendBusy(btn) || !!(el && el.disabled);
+          if (!busy) {
+            // 状态已收敛（app 处理完了）而内容还在 → 这才是"真没发出去"，可以放心补点一次。
+            // 注意与旧实现的区别：旧的是**在途时**补点（点一个 loading 按钮 = 点了也没用），
+            // 现在只在 app 已经处理完之后补点，补点才真的可能生效。
+            if (!retried && btn && !selfSend._isSendDisabled(btn)) {
+              retried = true;
+              log.warn("app 已处理完请求但没取走输入框内容 → 补点一次发送按钮");
+              Utils.clickEl(btn);
+              setTimeout(poll, tick); return;
+            }
+            selfSend._wxReportFail(el, sendPath, retried);
+            resolve(false); return;
+          }
+          if (ticks >= max) { selfSend._wxReportNoReply(ticks, tick, max); resolve(false); return; }
+          setTimeout(poll, tick);
+        })();
+      });
+    },
+
+    // 视频号发送"确实没生效"时的统一上报（诊断快照 + 文案）。
+    // 为什么必须给诊断：这条路径有多个长得一样的病因（按钮没找到 / 按钮被拒 / app 处理完却没取走内容），
+    // 2026-10-12～13 真机排查正是卡在"只有一句结论、分不清病因"上，白耗数轮。
+    _wxReportFail: function (el, sendPath, retried) {
+      var btn = this.findSendButton(el);
+      log.warn("发送未生效诊断：" + JSON.stringify(this.wxSendDiag(el, sendPath, btn)));
+      log.warn("app 已处理完请求，但输入框内容没被取走 → 这次**确实没发出去**" +
+        (retried ? "（已补点 1 次仍未生效）" : "") + "。请检查直播助手连接状态后重试");
+    },
+
+    // 到期仍在途：**结论未知**，不是失败 —— 这是本条修复的核心（旧实现正是在这里误报）。
+    _wxReportNoReply: function (ticks, tick, max) {
+      log.info("已点击发送，「主播发言」框仍显示处理中（按钮 loading）→ **未等到 app 回执，" +
+        "不能据此判定失败**：" + Math.round(max * tick / 1000) + "s 内 app 没回。" +
+        "请以直播间是否出现该弹幕为准；若确认没发出去，多半是助手长连接断开" +
+        "（控制台见 `websocket已断开…正在重连`）");
+    },
+
     // 输入框字数上限（取不到返回 0 = 未知）。eos 评论区实测 maxlength=50
     commentMaxLength: function () {
       var el = this.findCommentInput();
@@ -1255,6 +1665,62 @@
       return el.disabled === true ||
              el.getAttribute("aria-disabled") === "true" ||
              cls.indexOf("disable") !== -1;
+    },
+
+    // 视频号：发送按钮是否处于「发送中」（weui 用 class 表达在途请求：`weui-desktop-btn_loading`）。
+    // 为什么必须单列（2026-10-13 真机诊断 JSON 抓到）：`btnDisabled=false` 但 `btnCls` 含
+    // `weui-desktop-btn_loading` —— 这个状态**既不是禁用、也不能再点**（点了不会重发）。
+    // 旧判据只看 disable 子串 → 把在途按钮当成"可点" → 无谓补点一次 → 最后报出
+    // 「没找到可点的发送按钮 / 仅试过 Enter」，把病因指向**扩展**，而真实病因在页面侧。
+    _isSendBusy: function (el) {
+      if (!el) return false;
+      var cls = typeof el.className === "string" ? el.className.toLowerCase() : "";
+      return cls.indexOf("loading") !== -1;
+    },
+
+    // 视频号弹幕页：发送未生效时的诊断快照。
+    // 为什么需要它？旧实现只吐一句「评论可能未发出，输入框仍有内容」，而这句话对应
+    // **三种完全不同的病因**，无法区分（2026-10-12 真机排查就卡在这里耗掉数轮）：
+    //   btnFound=false        → 发送按钮压根没找到（真机 DOM 结构与夹具不一致）
+    //   btnDisabled=true      → 按钮还在禁用态（框架没认到刚才写入的输入）
+    //   path=enter            → 没点上按钮，退回了 Enter（视频号可能不支持 Enter 发送）
+    // scopeHtml 是输入区真实 DOM 片段（截断）—— 是"结构变了"时唯一能一次性定案的信息。
+    wxSendDiag: function (input, path, btn) {
+      var info = {
+        path: path || "",
+        val: input ? String(input.value || "").slice(0, 16) : "",
+        inShadow: !!(input && input.getRootNode && input.getRootNode() !== document),
+        btnFound: !!btn,
+        btnTag: btn ? btn.tagName : "",
+        btnCls: (btn && typeof btn.className === "string") ? btn.className.slice(0, 80) : "",
+        btnDisabled: btn ? this._isSendDisabled(btn) : null,
+        // 2026-10-13 真机日志新增：btnCls 里出现 `weui-desktop-btn_loading`（请求在途），
+        // 而 btnDisabled=false —— "在途"既不是禁用、也不能再点，必须单列出来。
+        btnLoading: btn ? this._isSendBusy(btn) : null,
+        // 输入框自身是否禁用：真机 scopeHtml 里是 `<textarea … disabled="disabled">`。
+        // app 在"发送中 / 未就绪"时会把输入框置灰；配上"内容还在"就能区分
+        // 「app 卡在发送中」与「我们的输入根本没进到 app 语义」。
+        inDisabled: !!(input && input.disabled),
+        // 2026-10-13 真机新增：**页面是否在后台**（主人"切到别的 tab"后故障集中出现）。
+        // 后台标签页会被 Chrome 节流，页面自身的助手长连接容易掉（`websocket已断开…重连`）
+        // → 输入框被置灰、按钮长期 loading。把它打进诊断，下次一眼就能看出
+        // "是页面侧的环境问题"还是"扩展没点到"。
+        hidden: !!document.hidden,
+      };
+      var scope = null;
+      try { scope = (input && input.closest) ? input.closest(".live-message-input-container") : null; } catch (_) {}
+      if (!scope) {
+        var cs = this.deepAll(".live-message-input-container", true);
+        scope = cs.length ? cs[0] : null;
+      }
+      if (!scope && input && input.parentElement) scope = input.parentElement.parentElement;
+      info.scopeCls = (scope && typeof scope.className === "string") ? scope.className.slice(0, 80) : "none";
+      try {
+        info.scopeHtml = scope
+          ? String(scope.outerHTML || "").replace(/\s+/g, " ").slice(0, 320)
+          : "";
+      } catch (_2) { info.scopeHtml = ""; }
+      return info;
     },
 
     // ---------- 最近发送记录（识别"自己发的弹幕"，避免自触发循环） ----------
@@ -1354,9 +1820,20 @@
       // ⚠️ 定位失败**不回退到通用打分**：这是 antd 页面，通用打分很容易把
       //    侧边栏/工具列表误判成弹幕列表（比"找不到"更糟）。返回 null，由调用方打日志留痕。
       if (Site.isWxch()) {
-        var wxList = document.querySelector(".live-message-scroller-container .comment__list") ||
-                     document.querySelector(".vue-recycle-scroller.comment__list") ||
-                     document.querySelector(".live-message-scroller-container");
+        // ⚠️ 必须 deepAll(..., true)：与评论输入框同因 —— 视频号是 **wujie 微前端**，
+        //    评论列表同样渲染在子应用的 shadow DOM 里，document.querySelector 恒 null，
+        //    表现为"一条弹幕也读不到"（2026-10-12 真机：商品页修好后才发现弹幕页也穿不透）。
+        //    force=true 是防「light DOM 里的隐藏空壳容器」短路掉 shadow 里的真容器。
+        var wxList = null;
+        var wxSels = [
+          ".live-message-scroller-container .comment__list",
+          ".vue-recycle-scroller.comment__list",
+          ".live-message-scroller-container",
+        ];
+        for (var wxs = 0; wxs < wxSels.length && !wxList; wxs++) {
+          var wxCands = this.deepAll(wxSels[wxs], true);
+          if (wxCands.length > 0) wxList = wxCands[0];
+        }
         if (wxList) {
           // 评论标签页被切走时容器还在但不可见 → 脚本照跑却读不到弹幕，
           // 提示一次（60s 节流），避免主人误以为"扩展坏了"
@@ -1368,6 +1845,11 @@
           this._danmakuCache.checkedAt = now;
           return wxList;
         }
+        log.warn("未找到弹幕列表容器（视频号·评论列表）：light 命中 " +
+          document.querySelectorAll(".live-message-scroller-container").length +
+          " 个，shadowRoots=" + ((this._deepStat && this._deepStat.shadowRoots) || 0) +
+          "，frames=" + ((this._deepStat && this._deepStat.frames) || 0) +
+          "（都为 0 说明页面还没渲染出来）");
         return null;
       }
       var cached = this._danmakuCache.container;
@@ -1873,40 +2355,44 @@
     },
 
     _doNext: function () {
-      try {
-        if (!this.running) return;
-        var msgs = this.config.messages;
-        if (msgs.length === 0) { this.stop(); return; }
+      if (!this.running) return;
+      var msgs = this.config.messages;
+      if (msgs.length === 0) { this.stop(); return; }
 
-        var idx = this._msgIndex % msgs.length;
-        var text = msgs[idx];
-        if (this.config.shuffle) {
-          idx = Math.floor(Math.random() * msgs.length);
-          text = msgs[idx];
-        }
+      var idx = this._msgIndex % msgs.length;
+      var text = msgs[idx];
+      if (this.config.shuffle) {
+        idx = Math.floor(Math.random() * msgs.length);
+        text = msgs[idx];
+      }
 
-        var ok = PageAPI.sendComment(text);
+      // 统一走异步入口：视频号要先"等页面就绪"，返回 Promise；其它站点返回同步布尔。
+      var self = this;
+      PageAPI.sendCommentAsync(text, function (ok) {
+        if (!self.running) return;
         if (ok) {
-          this._failCount = 0;
-          log.ok("已发送: " + text.substring(0, 30));
+          self._failCount = 0;
+          // 视频号：true 只代表"动作已提交"，真正的结果由结算日志（已送达 / 确实没发出去）给。
+          // 旧实现一律写"已发送"，在真机上出现过"面板说已发送、实际一条没出去"（2026-10-13）。
+          log.ok((Site.isWxch() ? "已提交发送: " : "已发送: ") + text.substring(0, 30));
+          self._msgIndex++;
+        } else if (PageAPI._lastSendSkip) {
+          // 页面未就绪（助手掉线 / 上一轮请求在途）→ **跳过：不计失败、不推进序号**。
+          // 不推进是为了不打乱消息顺序（恢复后这条会重发）；不计失败是为了别被
+          // 连续 3 次"跳过"误判成"页面结构变了"而自动停掉。
+          log.warn("本条跳过（未发出、不计失败，下轮重试）；原因见上一条日志");
         } else {
-          this._failCount++;
+          self._failCount++;
           log.warn("发送失败，未找到聊天输入框和发送按钮");
-          if (this._failCount >= 3) {
+          self._msgIndex++;
+          if (self._failCount >= 3) {
             log.err("连续 3 次发送失败，自动停止（页面结构可能已变化，请刷新后重试）");
-            this.stop();
+            self.stop();
             return;
           }
         }
-
-        this._msgIndex++;
-        this._scheduleNext();
-      } catch (e) {
-        log.err("自动发评出错: " + e.message);
-        this._failCount++;
-        if (this._failCount >= 3) { this.stop(); return; }
-        this._scheduleNext();
-      }
+        self._scheduleNext();
+      });
     },
 
     _scheduleNext: function () {
@@ -2187,28 +2673,37 @@
       var delay = this.config.delayMin + Math.random() * Math.max(this.config.delayMax - this.config.delayMin, 0);
       var self = this;
       setTimeout(function () {
-        try {
-          var ok = PageAPI.sendComment(item.reply);
-          if (ok) {
-            self._failCount = 0;
-            self._repliedCount++;
-            self._sentThisMinute.push(Date.now());
-            log.ok("已回复" + (item.nickname ? " @" + item.nickname : "") + ": " + item.reply.substring(0, 30));
-          } else {
-            self._failCount++;
-            log.warn("回复发送失败，未找到聊天输入框");
-            if (self._failCount >= 3) {
-              log.err("弹幕回复：连续 3 次发送失败，自动停止（页面结构可能已变化，请刷新后重试）");
-              self.stop();
-              return;
+        PageAPI.sendCommentAsync(item.reply, function (ok) {
+          var stopped = false;
+          try {
+            if (ok) {
+              self._failCount = 0;
+              self._repliedCount++;
+              self._sentThisMinute.push(Date.now());
+              log.ok("已回复" + (item.nickname ? " @" + item.nickname : "") + ": " + item.reply.substring(0, 30));
+            } else if (PageAPI._lastSendSkip) {
+              // 页面未就绪（助手掉线 / 上一轮请求在途）→ 跳过：不计失败、不计入限频与回复数。
+              // 这条回复不再重试（弹幕回复是"当时那句"，补发已无意义），避免队列堆积。
+              log.warn("页面未就绪，本条回复跳过（不计失败）");
+            } else {
+              self._failCount++;
+              log.warn("回复发送失败，未找到聊天输入框");
+              if (self._failCount >= 3) {
+                log.err("弹幕回复：连续 3 次发送失败，自动停止（页面结构可能已变化，请刷新后重试）");
+                self.stop();
+                stopped = true;
+              }
             }
+          } catch (e) {
+            log.err("弹幕回复出错: " + e.message);
           }
-        } catch (e) {
-          log.err("弹幕回复出错: " + e.message);
-        }
-        self._sending = false;
-        // 发送间隔至少 1.5s，避免输入框内容被下一条覆盖
-        setTimeout(function () { self._drainQueue(); }, 1500);
+          // ⚠️ _sending 必须**无条件**复位：旧实现在 stop() 那条路径上直接 return，
+          // 把 _sending 永久留在 true —— 重新启动后所有回复都排不进队列（静默失效）。
+          self._sending = false;
+          if (stopped) return;
+          // 发送间隔至少 1.5s，避免输入框内容被下一条覆盖
+          setTimeout(function () { self._drainQueue(); }, 1500);
+        });
       }, Math.round(delay * 1000));
     },
 
@@ -2491,16 +2986,30 @@
             if (lp && lp.success && lp.products && lp.products.length) {
               log.info("商品页商品列表已载入面板（共 " + lp.count + " 个，见上方列表）");
             } else {
-              log.info("商品页尚未打开，正在替你打开…");
+              // 注意这句覆盖**两种**情况：商品页真的没开，或开了但商品还没渲染出来。
+              // 不能只写"尚未打开"—— 后者会把人引向"页面明明开着，为什么说没开"的误判。
+              log.info("商品页尚未就绪（未打开 / 商品未渲染出来），正在后台打开并接管…");
+              // 目标页把扫描诊断带回来了 → 直接打出来（弹幕页看不到商品页的 DOM）
+              if (lp && lp.diag) log.warn("商品页扫描诊断：" + JSON.stringify(lp.diag));
             }
-            // ② 再让商品页启动讲解（缺页时 background 后台打开并等就绪，最多约 20s）
+            // ② 再让商品页启动讲解（缺页时 background 后台打开并**等商品渲染出来**，
+            //    最长约 25s）。这里给 30s，必须比 background 的等待长 —— 否则
+            //    本页先超时，会误报"跨页调用超时（目标页面可能没打开）"，
+            //    而真实原因是"商品还没渲染出来"。
+            // 超时 45s = background 的等待（缺页 25s / 已存在 8s）+ 商品页自己的
+            // "等商品渲染"（8s）都留足余量。**必须比它们加起来长**，
+            // 否则本页先超时会误报"跨页调用超时"，把"商品没渲染出来"掩盖掉。
             return Cross.call("explain_start", {
               indices: wxIndices,
               interval: cfg.interval,
               randomDelay: cfg.randomDelay,
               shuffle: cfg.shuffle,
-            }, 20000);
+              sinceSeq: Panel._goodsLogSeq,   // 只取还没见过的日志（见 _absorbGoodsLogs）
+            }, 45000);
           }).then(function (r) {
+            // 商品页启动瞬间的日志（"已选择 N 个商品" / "自动讲解已启动" / "扫描到…本轮开始"）
+            // 立刻打到本页面板 —— 不等下一次 5s 轮询，否则看起来像"点了开始没反应"。
+            Panel._absorbGoodsLogs(r);
             if (r && r.success) {
               log.ok("商品页已接管，自动讲解启动（共 " + r.count + " 个商品）");
               Panel._remoteExplain = true;
@@ -2758,6 +3267,35 @@
     // ----------------------------------------------------------------------
     _runState: null,
 
+    // ---- 跨页日志回传的**接收侧**（见文件头 log._relay 的注释）-----------------
+    // 弹幕页把商品页回传的日志增量打进自己的面板/控制台，让"讲解跑到哪一步"可见。
+    // 商品页不建面板、又是后台标签页 → 不这样捞，主人就永远看不到讲解日志。
+    _goodsLogSeq: 0,     // 已见过的最大 seq（下次只取更新的）
+    _goodsLogEpoch: 0,   // 商品页的加载 epoch；变了 = 它刷新过 → 游标必须归零
+
+    _absorbGoodsLogs: function (r) {
+      if (!r) return;
+      // ⚠️ 商品页刷新后 _relaySeq 从 0 重来：若还拿旧的大游标做 "> seq" 过滤，
+      // 新日志（seq=1,2,3…）永远小于旧游标 → **再也不显示**。靠 epoch 变化察觉并归零。
+      if (r.logEpoch && r.logEpoch !== this._goodsLogEpoch) {
+        this._goodsLogEpoch = r.logEpoch;
+        this._goodsLogSeq = 0;
+      }
+      var items = r.logs || [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i] || {};
+        if (typeof it.seq === "number") {
+          if (it.seq <= this._goodsLogSeq) continue;   // 去重（防同一批被打印两次）
+          this._goodsLogSeq = it.seq;
+        }
+        // 前缀标明来源：面板上要能一眼分出"这句是商品页说的，不是我说的"
+        var m = "[商品页] " + (it.msg || "");
+        if (it.level === "error") log.err(m);
+        else if (it.level === "warn") log.warn(m);
+        else log.info(m);
+      }
+    },
+
     _syncRunState: function () {
       // 注意：AutoExplain 等是本 IIFE 内的 var 声明，**不会**挂到 window 上，
       // 必须直接引用标识符（写成 window.AutoExplain 会恒为 undefined → 状态永远同步不上）
@@ -2869,10 +3407,14 @@
           if (!params.text) {
             result = { success: false, error: "missing text" };
           } else {
-            var ok = PageAPI.sendComment(params.text);
-            result = ok
-              ? { success: true, text: params.text }
-              : { success: false, error: "发送失败，未找到输入框" };
+            // 视频号：sendComment 返回 Promise（要先等页面就绪）→ 必须等结算后再组回包。
+            // 把 Promise 当布尔用会**立刻回 success**（真实结果被丢掉）。result 是 Promise 时，
+            // 下面的 Promise.resolve(result) 已能正确收口（那正是为 eos 的异步 clickExplain 加的）。
+            result = Promise.resolve(PageAPI.sendComment(params.text)).then(function (ok) {
+              if (ok) return { success: true, text: params.text };
+              // 未就绪"跳过"要如实回包，别让调用方以为已经发出去了
+              return { success: false, error: PageAPI._lastSendSkip || "发送失败，未找到输入框" };
+            });
           }
           break;
 
@@ -2903,10 +3445,25 @@
             autoReplyRunning: AutoReply.running,
             site: Site.detect(),
             siteLabel: Site.label(),
-            productCount: (PageAPI._cache.products || []).length,
+            // 视频号商品页：productCount 必须**实时扫**——跨页链路靠它判断
+            // "商品到底渲染出来没有"（background 的"等就绪"判据，见 js/background.js）。
+            // 读缓存是查不出这个的：缓存初始就是 []，而商品页不建面板、没人调过 scanProducts
+            // → 恒为 0 → 判据永远不满足。
+            // 其它站点保持读缓存（面板轮询够用），不给它们加无谓的全页扫描。
+            productCount: Site.isWxch()
+              ? PageAPI.scanProducts().length
+              : (PageAPI._cache.products || []).length,
             explainRounds: AutoExplain._rounds,
             replyStats: AutoReply.getStats(),
           };
+          // 视频号商品页：把讲解日志的**增量**一并带回（跨页日志回传）。
+          // 为什么必须走这条已有通道：商品页不建面板 + 后台标签页 → 它的日志对主人
+          // 完全不可见（2026-10-13 实测："讲解生效了，但看不到讲解日志"）。
+          if (Site.isWxch() && Site.page() === "goods") {
+            result.logEpoch = log._epoch;
+            result.logSeq = log._relaySeq;
+            result.logs = _relaySince(params && params.sinceSeq);
+          }
           break;
 
         default:
@@ -2971,10 +3528,52 @@
         live: PageAPI._isRowLive(products[i]),
       });
     }
-    return { success: true, count: list.length, products: list };
+    // 视频号：清单为空时把**本页的诊断**一并带回。调用方（弹幕页）看不到本页 DOM，
+    // 一句"清单是空的"说明不了"是没渲染完、还是按钮结构没认出来" → 顺手带回去，
+    // 弹幕页那一行日志就能直接说清原因（真机排查全靠这个，别再让人从"链路通不通"查起）。
+    var out = { success: true, count: list.length, products: list };
+    if (Site.isWxch() && list.length === 0) out.diag = PageAPI.wxScanDiag();
+    return out;
   }
 
   // 跨页启动自动讲解。params 经 postMessage 过来，只接受原始类型（不能传对象引用/函数）。
+  // 视频号商品页：等到"真的扫得到商品"再启动（最多 maxMs，每 700ms 强制重扫一次）。
+  //
+  // 为什么这个判据必须放在**本页重试**，而不是靠调用方（background 的 ping）判断一次：
+  //   2026-10-12 真机踩到 —— background ping 到 productCount>0（快照为真）→ 马上转发
+  //   explain_start → 本页 scanProducts() 却是 0 → 启动失败。两次都是同一段 DOM 扫描、
+  //   相隔不到 1 秒，唯一的解释是**这一页在刷数据/断线重连时会把商品表短暂换掉**
+  //   （Vue 的 loading 态：先卸载表格、接口回来再装回来）。
+  //   调用方只能取到"某一瞬间"的快照，覆盖不了这种瞬态；只有本页能"重试到扫得到为止"。
+  var WX_WAIT_MS = 8000;
+  function waitWxProducts(maxMs) {
+    var t0 = Date.now();
+    var attempt = 0;
+    function once() {
+      attempt++;
+      var list = PageAPI.forceScan();     // 强制重扫，绕开 1s 缓存
+      if (list.length > 0) return Promise.resolve(list.length);
+      if (Date.now() - t0 >= maxMs) {
+        log.warn("等商品渲染超时（" + Math.round((Date.now() - t0) / 1000) + "s，试了 " + attempt +
+          " 次）诊断=" + JSON.stringify(PageAPI.wxScanDiag()));
+        return Promise.resolve(0);
+      }
+      return Utils.sleep(700).then(once);
+    }
+    return once();
+  }
+
+  // 取 log._relay 中 seq > since 的增量（跨页日志回传用）。
+  // since = 调用方已经见过的最大 seq，缺省 0 表示全量。
+  function _relaySince(since) {
+    var s = (typeof since === "number") ? since : 0;
+    var out = [];
+    for (var i = 0; i < log._relay.length; i++) {
+      if (log._relay[i].seq > s) out.push(log._relay[i]);
+    }
+    return out;
+  }
+
   // config 用白名单逐项赋值，不让调用方塞进奇怪东西。
   function _explainStart(params) {
     if (!Site.hasGoodsSide()) {
@@ -2987,14 +3586,46 @@
       AutoExplain.config.randomDelay = params.randomDelay;
     }
     AutoExplain.config.shuffle = !!params.shuffle;
-    AutoExplain.start(typeof params.indices === "string" ? params.indices : "");
-    return {
-      success: !!AutoExplain.running,
-      running: !!AutoExplain.running,
-      count: (AutoExplain._order || []).length,
-      // 启动失败的原因在目标页日志里，这里补一句给调用方，免得只看到 success:false
-      error: AutoExplain.running ? undefined : "目标页未能启动（看商品页日志：可能无商品或序号无效）",
-    };
+
+    var indices = typeof params.indices === "string" ? params.indices : "";
+
+    // 视频号：先等商品真的扫得到（见上）；其它站点行为完全不变。
+    return (Site.isWxch() ? waitWxProducts(WX_WAIT_MS) : Promise.resolve(1)).then(function (n) {
+      if (n === 0) {
+        return {
+          success: false,
+          running: false,
+          count: 0,
+          productCount: 0,
+          diag: PageAPI.wxScanDiag(),
+          error: "目标页扫到 0 个商品（已等 " + (WX_WAIT_MS / 1000) +
+            "s：既不是没渲染完，那就是这场真没有）诊断=" + JSON.stringify(PageAPI.wxScanDiag()),
+        };
+      }
+      AutoExplain.start(indices);
+      var running = !!AutoExplain.running;
+      // 失败原因必须**报得准**：调用方（弹幕页）看不到本页 DOM，笼统一句"未能启动"
+      // 会让排查方向发散（2026-10-12 就是因为这句话，先去怀疑链路没通，白查一轮）。
+      // 这里带上实测商品数 + 扫描诊断 → 一眼分辨「页面还没渲染出商品」「按钮结构变了」
+      // 还是「序号写错了」。
+      var scanned = PageAPI.scanProducts().length;
+      return {
+        success: running,
+        running: running,
+        count: (AutoExplain._order || []).length,
+        productCount: scanned,
+        diag: PageAPI.wxScanDiag(),
+        // 启动瞬间的日志（"已选择 N 个商品" / "自动讲解已启动" / "扫描到 N 个商品，本轮开始"）
+        // 一起带回 —— 否则它们要等下一次 5s 轮询才出现，看起来像"点了开始没反应"。
+        logEpoch: log._epoch,
+        logSeq: log._relaySeq,
+        logs: _relaySince(params && params.sinceSeq),
+        error: running ? undefined
+          : (scanned === 0
+              ? "目标页扫到 0 个商品（商品列表未渲染完，或这场直播本就没有商品）"
+              : "目标页有 " + scanned + " 个商品，但按序号筛选后没有可讲解项（请检查序号）"),
+      };
+    });
   }
 
   // ========================================================================
@@ -3035,7 +3666,9 @@
       setInterval(function () {
         // side:"goods" 是**显式提示**：get_status 这个名字看不出属于哪一侧，
         // 靠它让 background 把这条路由到商品页（否则会被路由回弹幕页自己 → 永远 false）
-        Cross.call("get_status", { side: "goods" }, 4000).then(function (r) {
+        // sinceSeq：只让商品页回传"本页还没见过"的日志增量（见 Panel._absorbGoodsLogs）
+        Cross.call("get_status", { side: "goods", sinceSeq: Panel._goodsLogSeq }, 4000).then(function (r) {
+          Panel._absorbGoodsLogs(r);   // 商品页的讲解日志 → 本页面板（跨页日志回传）
           var on = !!(r && r.success && r.autoExplainRunning);
           if (on !== Panel._remoteExplain) {
             Panel._remoteExplain = on;
