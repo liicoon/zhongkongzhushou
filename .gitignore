@@ -13,3 +13,5 @@ node_modules/
 
 # 测试运行输出（每次跑都变，不入库）
 tests/out/
+# 测试套件不入库（本地保留）
+tests/
